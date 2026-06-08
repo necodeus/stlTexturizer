@@ -5392,10 +5392,26 @@ async function importProject(file) {
   if (file.size > PROJECT_MAX_IMPORT) {
     throw new Error(`File too large (${(file.size / 1024 / 1024).toFixed(1)} MB, max 500 MB)`);
   }
+  const buf = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+
+  // A .bumpmesh project is a ZIP (PK\x03\x04). If the user picked a bare model
+  // file here instead — common on macOS Chrome, where the accept=".bumpmesh"
+  // filter doesn't reliably hide .stl/.obj files — route it to the model loader
+  // rather than failing with a cryptic "invalid zip data". A 3MF is also a ZIP,
+  // so trust the extension first and fall back to the magic-byte sniff for
+  // extension-less STLs.
+  const isModelExt = /\.(stl|obj|3mf)$/i.test(file.name);
+  const isZip = bytes[0] === 0x50 && bytes[1] === 0x4B &&
+                bytes[2] === 0x03 && bytes[3] === 0x04;
+  if (isModelExt || !isZip) {
+    await handleModelFile(file);
+    return;
+  }
+
   _undoApplyDepth++;
   try {
-  const buf = await file.arrayBuffer();
-  const unzipped = unzipSync(new Uint8Array(buf));
+  const unzipped = unzipSync(bytes);
 
   const settingsBytes = unzipped['settings.json'];
   const data = settingsBytes ? JSON.parse(strFromU8(settingsBytes)) : null;
