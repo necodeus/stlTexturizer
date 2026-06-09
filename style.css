@@ -1816,9 +1816,18 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   user-select: none;
 }
 
-.export-dialog label input[type="checkbox"] {
+.export-dialog label input[type="checkbox"],
+.export-dialog label input[type="radio"] {
   accent-color: var(--accent);
   cursor: pointer;
+}
+
+.export-dialog-title {
+  margin: 0 0 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim, var(--text));
+  max-width: 200px;
 }
 
 .export-dialog label input:disabled {

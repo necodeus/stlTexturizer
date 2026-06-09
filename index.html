@@ -73,6 +73,12 @@
         <label for="import-project-input" class="icon-btn text-btn" data-i18n-title="header.importProject" title="Load project (.bumpmesh)" role="button" tabindex="0">
           <span data-i18n="header.load">Load</span>
         </label>
+        <div id="load-dialog" class="export-dialog hidden">
+          <p class="export-dialog-title" data-i18n="header.loadDialogTitle">This project includes a model. Load:</p>
+          <label><input type="radio" name="load-mode" id="load-mode-all" value="all" /> <span data-i18n="header.loadModelLabel">Model + settings</span></label>
+          <label><input type="radio" name="load-mode" id="load-mode-settings" value="settings" /> <span data-i18n="header.loadSettingsLabel">Settings only</span></label>
+          <button id="load-go-btn" class="export-go-btn" data-i18n="header.loadGo">Load</button>
+        </div>
         <div id="export-dialog" class="export-dialog hidden">
           <label><input type="checkbox" id="export-settings-chk" checked disabled /> <span data-i18n="header.exportSettingsLabel">Settings</span></label>
           <label><input type="checkbox" id="export-model-chk" checked /> <span data-i18n="header.exportModelLabel">Model (STL)</span></label>

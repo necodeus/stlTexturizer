@@ -27,6 +27,7 @@ import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
 let currentGeometry   = null;   // original loaded geometry
 let currentBounds     = null;   // bounds of the original geometry
 let currentStlName    = 'model'; // base filename of the loaded STL (no extension)
+let currentStlExt     = '.stl';  // source file extension (.stl/.obj/.3mf), for the stats line
 let activeMapEntry    = null;   // { name, texture, imageData, width, height, isCustom? }
 let _lastCustomMap    = null;   // most recent uploaded/imported custom-map entry, kept across preset switches so the thumbnail can re-activate it
 let previewMaterial   = null;
@@ -230,6 +231,15 @@ const customMapRow      = document.getElementById('custom-map-row');
 const customMapSwatch   = document.getElementById('custom-map-swatch');
 const customMapRemoveBtn = document.getElementById('custom-map-remove');
 const meshInfo       = document.getElementById('mesh-info');
+
+// Render the bottom-left mesh stats line, prefixed with the loaded model's
+// name (currentStlName, extension-stripped) so the user can see which file
+// the stats belong to.
+function _setMeshInfo(triCount, mb, sx, sy, sz) {
+  const stats = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  const fileName = currentStlName ? `${currentStlName}${currentStlExt}` : '';
+  meshInfo.textContent = fileName ? `${fileName} · ${stats}` : stats;
+}
 const exportBtn        = document.getElementById('export-btn');
 const export3mfBtn     = document.getElementById('export-3mf-btn');
 const exportProgress   = document.getElementById('export-progress');
@@ -925,7 +935,7 @@ function populateLanguageSelector() {
       const sx = currentBounds.size.x.toFixed(2);
       const sy = currentBounds.size.y.toFixed(2);
       const sz = currentBounds.size.z.toFixed(2);
-      meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+      _setMeshInfo(triCount, mb, sx, sy, sz);
       refreshExclusionOverlay();
       if (lastFastDiag) renderFastDiag(lastFastDiag);
       if (lastAdvancedDiag) renderAdvancedDiag(lastAdvancedDiag);
@@ -2342,7 +2352,7 @@ function handlePlaceOnFaceClick(e) {
   const sx = currentBounds.size.x.toFixed(2);
   const sy = currentBounds.size.y.toFixed(2);
   const sz = currentBounds.size.z.toFixed(2);
-  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  _setMeshInfo(triCount, mb, sx, sy, sz);
 
   exportBtn.disabled = (activeMapEntry === null);
   export3mfBtn.disabled = (activeMapEntry === null);
@@ -2788,6 +2798,7 @@ function loadDefaultCube() {
   currentGeometry = geo;
   currentBounds   = computeBounds(geo);
   currentStlName  = 'cube_50x50x50';
+  currentStlExt   = '.stl';
   checkAmplitudeWarning();
 
   loadGeometry(geo);
@@ -2841,7 +2852,7 @@ function loadDefaultCube() {
   const sx = currentBounds.size.x.toFixed(2);
   const sy = currentBounds.size.y.toFixed(2);
   const sz = currentBounds.size.z.toFixed(2);
-  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  _setMeshInfo(triCount, mb, sx, sy, sz);
 
   exportBtn.disabled = (activeMapEntry === null);
   export3mfBtn.disabled = (activeMapEntry === null);
@@ -2864,6 +2875,8 @@ async function handleModelFile(file) {
     currentGeometry = geometry;
     currentBounds   = bounds;
     currentStlName  = file.name.replace(/\.(stl|obj|3mf)$/i, '');
+    const _extMatch = file.name.match(/\.(stl|obj|3mf)$/i);
+    currentStlExt   = _extMatch ? _extMatch[0].toLowerCase() : '';
     checkAmplitudeWarning();
 
     // Log (but don't block the user with an alert) if bad triangles were
@@ -2983,7 +2996,7 @@ async function handleModelFile(file) {
     const sx = bounds.size.x.toFixed(2);
     const sy = bounds.size.y.toFixed(2);
     const sz = bounds.size.z.toFixed(2);
-    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+    _setMeshInfo(triCount, mb, sx, sy, sz);
 
     exportBtn.disabled = (activeMapEntry === null);
     export3mfBtn.disabled = (activeMapEntry === null);
@@ -4039,7 +4052,7 @@ function deactivatePrecisionMasking() {
     const sx = currentBounds.size.x.toFixed(2);
     const sy = currentBounds.size.y.toFixed(2);
     const sz = currentBounds.size.z.toFixed(2);
-    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+    _setMeshInfo(triCount, mb, sx, sy, sz);
   } else if (precisionExcludedFaces.size > 0 && precisionParentMap) {
     // No precision geometry but have selections — map back to original
     excludedFaces = new Set();
@@ -4154,7 +4167,7 @@ async function refreshPrecisionMesh() {
     const sx = currentBounds.size.x.toFixed(2);
     const sy = currentBounds.size.y.toFixed(2);
     const sz = currentBounds.size.z.toFixed(2);
-    meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+    _setMeshInfo(triCount, mb, sx, sy, sz);
 
     if (safetyCapHit) {
       triLimitWarning.classList.remove('hidden');
@@ -4990,7 +5003,7 @@ function adoptBakedGeometry(geometry, bounds, opts = {}) {
   const sx = bounds.size.x.toFixed(2);
   const sy = bounds.size.y.toFixed(2);
   const sz = bounds.size.z.toFixed(2);
-  meshInfo.textContent = t('ui.meshInfo', { n: triCount.toLocaleString(), mb, sx, sy, sz });
+  _setMeshInfo(triCount, mb, sx, sy, sz);
 
   exportBtn.disabled = (activeMapEntry === null);
   export3mfBtn.disabled = (activeMapEntry === null);
@@ -5299,6 +5312,10 @@ const exportModelChk    = document.getElementById('export-model-chk');
 const exportTextureChk  = document.getElementById('export-texture-chk');
 const exportTextureRow  = document.getElementById('export-texture-row');
 const importProjectInput = document.getElementById('import-project-input');
+const loadDialog        = document.getElementById('load-dialog');
+const loadModeAllRadio  = document.getElementById('load-mode-all');
+const loadModeSettingsRadio = document.getElementById('load-mode-settings');
+const loadGoBtn         = document.getElementById('load-go-btn');
 
 exportProjectBtn.addEventListener('click', (e) => {
   e.stopPropagation();
@@ -5478,35 +5495,75 @@ async function importProject(file) {
     return;
   }
 
-  _undoApplyDepth++;
-  try {
   const unzipped = unzipSync(bytes);
 
   const settingsBytes = unzipped['settings.json'];
   const data = settingsBytes ? JSON.parse(strFromU8(settingsBytes)) : null;
-
-  // 1) Load model first — handleModelFile resets scaleU/scaleV/offsets/refineLength
-  //    AND clears any existing paint mask, so applied settings + restored mask
-  //    below will correctly override those resets.
   const hasModel = !!unzipped['model.stl'];
+
+  // Decide what to load. When the file carries a model the user chooses whether
+  // to replace their current model ('all') or keep it and apply settings only
+  // ('settings'). A file without a model is always settings-only — nothing to
+  // ask. The prompt runs BEFORE we touch any state, so dismissing it is a no-op.
+  let loadMode = 'settings';
   if (hasModel) {
-    const stlFile = new File([unzipped['model.stl']], 'model.stl', { type: 'application/octet-stream' });
-    await handleModelFile(stlFile);
+    const choice = await promptLoadMode();
+    if (choice === null) return; // dialog dismissed → load nothing
+    loadMode = choice;
   }
 
-  // 2) Apply settings after any model reset.
-  if (data) applySettingsSnapshot(data);
+  // Flush any pending settings change so it lands as its own undo step, keeping
+  // the pre-load baseline accurate for the settings-only commit below.
+  _flushUndoCapture();
 
-  // 2b) Restore paint mask — only meaningful when the project shipped a model,
-  //     since indices reference that exact triangle set.
-  if (hasModel && unzipped['mask.json']) {
-    try {
-      const mask = JSON.parse(strFromU8(unzipped['mask.json']));
-      _restoreMask(mask);
-    } catch (err) { console.warn('Could not restore paint mask:', err); }
+  _undoApplyDepth++;
+  try {
+    if (loadMode === 'all') {
+      // Load model first — handleModelFile resets scaleU/scaleV/offsets/refineLength
+      // AND clears any existing paint mask, so applied settings + restored mask
+      // below will correctly override those resets.
+      const stlFile = new File([unzipped['model.stl']], 'model.stl', { type: 'application/octet-stream' });
+      await handleModelFile(stlFile);
+
+      // Apply settings after the model reset.
+      if (data) applySettingsSnapshot(data);
+
+      // Restore paint mask — only meaningful here, since its indices reference
+      // the model we just loaded.
+      if (unzipped['mask.json']) {
+        try {
+          const mask = JSON.parse(strFromU8(unzipped['mask.json']));
+          _restoreMask(mask);
+        } catch (err) { console.warn('Could not restore paint mask:', err); }
+      }
+    } else {
+      // Settings only: keep the current model and its mask untouched. We skip
+      // model.stl (and never call handleModelFile, so the scale/offset/refine
+      // resets don't fire) and mask.json (its indices belong to the saved
+      // model, not the live one).
+      if (data) applySettingsSnapshot(data);
+    }
+
+    await _applyImportedTexture(unzipped, data);
+
+    _autoSaveSettings();
+  } finally {
+    _undoApplyDepth--;
+    if (loadMode === 'all') {
+      // Full import = fresh start; mask indices belong to the imported model.
+      _clearUndoStacks();
+    } else {
+      // Settings-only is an undoable settings change on the unchanged model.
+      _commitUndoCapture();
+    }
   }
+}
 
-  // 3) Texture: custom PNG wins over named preset.
+/**
+ * Apply a project's texture: custom PNG wins over a named preset. Shared by
+ * both load modes — the displacement map is part of the saved settings.
+ */
+async function _applyImportedTexture(unzipped, data) {
   if (unzipped['texture.png']) {
     const texName = (data && data.activeMapName) || 'imported-texture.png';
     const texFile = new File([unzipped['texture.png']], texName, { type: 'image/png' });
@@ -5522,13 +5579,43 @@ async function importProject(file) {
   } else if (data && data.activeMapName) {
     _selectPresetByName(data.activeMapName);
   }
+}
 
-  _autoSaveSettings();
-  } finally {
-    _undoApplyDepth--;
-    // Imported project = fresh start; mask indices belong to the imported model.
-    _clearUndoStacks();
-  }
+/**
+ * Show the load-mode dialog and resolve to 'all' (model + settings),
+ * 'settings' (settings only), or null if the user dismisses it. Defaults to
+ * 'settings' when a model is already loaded (protect what you're working on),
+ * otherwise 'all' (you need the file's model to see anything).
+ */
+function promptLoadMode() {
+  return new Promise((resolve) => {
+    const keepCurrent = !!currentGeometry;
+    loadModeSettingsRadio.checked = keepCurrent;
+    loadModeAllRadio.checked = !keepCurrent;
+    loadDialog.classList.remove('hidden');
+
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      loadDialog.classList.add('hidden');
+      loadGoBtn.removeEventListener('click', onGo);
+      document.removeEventListener('click', onOutside, true);
+      document.removeEventListener('keydown', onKey, true);
+      resolve(result);
+    };
+    const onGo = () => finish(loadModeSettingsRadio.checked ? 'settings' : 'all');
+    const onOutside = (e) => { if (!loadDialog.contains(e.target)) finish(null); };
+    const onKey = (e) => { if (e.key === 'Escape') finish(null); };
+
+    loadGoBtn.addEventListener('click', onGo);
+    // Defer the dismiss listeners so the click/change that opened the picker
+    // doesn't immediately close the dialog.
+    setTimeout(() => {
+      document.addEventListener('click', onOutside, true);
+      document.addEventListener('keydown', onKey, true);
+    }, 0);
+  });
 }
 
 // ── Undo / Redo ──────────────────────────────────────────────────────────────
