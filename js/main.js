@@ -4090,9 +4090,11 @@ async function refreshPrecisionMesh() {
   const brushDiameter = parseFloat(exclBrushRadiusSlider.value);
   const targetEdge = computePrecisionEdgeLength(brushDiameter);
 
-  // Estimate triangle count and warn if > 5M
+  // Estimate triangle count and warn if > 8M (threshold raised June 2026 —
+  // the typed-array subdivision is ~2× faster with far less GC churn, so the
+  // point where a confirm is warranted moved up accordingly)
   const estimated = estimateSubdivisionTriCount(currentGeometry, targetEdge);
-  if (estimated > 5_000_000) {
+  if (estimated > 8_000_000) {
     const estLabel = (estimated / 1_000_000).toFixed(1) + 'M';
     const msg = t('precision.warningBody', { n: estLabel });
     if (!confirm(msg)) return;
