@@ -43,6 +43,7 @@
  */
 
 import * as THREE from 'three';
+import { QuantizedPointMap } from './meshIndex.js';
 
 // Vertex-weld quantisation for buildIndexed. 1e6 → 1 nm cells, finer than the
 // float32 resolution of the incoming positions, so it behaves as exact-float
@@ -58,10 +59,7 @@ import * as THREE from 'three';
 // edges. (1e5 was an intermediate improvement but still fused ~100 vertices at
 // fine resolution.) Measured, not estimated.
 //
-// QOFFSET/field width give a ±2147 mm coordinate range — ample for any printable
-// part; beyond that the packed keys would collide.
 const QUANT_DEFAULT = 1e6;
-const QOFFSET       = 2147483648; // 2^31 — keeps round(coord*QUANT)+offset ≥ 0 for |coord| ≤ 2147 mm
 const FLIP_DOT      = 0.2;  // cos ~78° — reject collapse if new normal deviates more
 const FLIP_DOT_SQ   = FLIP_DOT * FLIP_DOT;
 const CREASE_COS    = 0.5;  // cos 60° — edges sharper than this are treated as creases
@@ -134,22 +132,21 @@ export async function decimate(geometry, targetTriangles, onProgress, harvestFla
   let   lkEpoch = 1;
   let   activeFaces = faceCount;
 
-  // Seed min-heap with one entry per unique edge.
-  // Use Number keys when vertCount < 94M (safe integer range), BigInt otherwise.
+  // Seed min-heap with one entry per unique edge. Dedup via the integer
+  // pair-keyed hash map (no V8 Set entry cap, no per-key boxing); seeding
+  // order over faces/edges is unchanged.
   const heap     = new SoAHeap(Math.min(faceCount * 3, 1 << 24));
-  const seedSeen = new Set();
-  const _useNumericSeed = vertCount < 94_000_000;
+  const seedSeen = new QuantizedPointMap(1, Math.min(faceCount * 3, 1 << 22));
   for (let f = 0; f < faceCount; f++) {
     if (faces[f * 3] < 0) continue;
     for (let e = 0; e < 3; e++) {
       const va = faces[f * 3 + e];
       const vb = faces[f * 3 + ((e + 1) % 3)];
       const lo = va < vb ? va : vb, hi = va < vb ? vb : va;
-      const ek = _useNumericSeed ? lo * vertCount + hi : BigInt(lo) * BigInt(vertCount) + BigInt(hi);
-      if (!seedSeen.has(ek)) { seedSeen.add(ek); pushEdge(heap, quadrics, positions, version, va, vb); }
+      seedSeen.getOrSet(lo, hi, 0, 1);
+      if (seedSeen.inserted) pushEdge(heap, quadrics, positions, version, va, vb);
     }
   }
-  seedSeen.clear();
 
   const initFaces  = activeFaces;
   // Progress denominator: triangles to remove to reach the target. When already
@@ -417,16 +414,6 @@ function checkFlipped(positions, vfHead, slotFace, slotNext, faces, vc, vo, npx,
   return false;
 }
 
-function faceNormal(ax, ay, az, bx, by, bz, cx, cy, cz) {
-  const ux = bx - ax, uy = by - ay, uz = bz - az;
-  const vx = cx - ax, vy = cy - ay, vz = cz - az;
-  const nx = uy * vz - uz * vy;
-  const ny = uz * vx - ux * vz;
-  const nz = ux * vy - uy * vx;
-  const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
-  return [nx / len, ny / len, nz / len];
-}
-
 // ── Quadric helpers ──────────────────────────────────────────────────────────
 // Symmetric 4×4 quadric stored as 10 upper-triangle values per vertex.
 
@@ -439,56 +426,77 @@ function faceNormal(ax, ay, az, bx, by, bz, cx, cy, cz) {
 // smooth-surface edges and are therefore collapsed last (or not at all).
 
 function addCreaseQuadrics(quadrics, positions, faces, faceCount) {
-  // Build edge → [face, face] map using numeric keys (va_lo * vertMax + vb_hi)
-  // vertMax = next power of two >= faceCount*3 vertices upper bound; use faceCount*3
-  // as a safe upper bound since #verts ≤ #triangles*3.
-  // We already have the actual vertCount from the caller but it's not passed here;
-  // use a Map with numeric key = min*N + max where N = faceCount*3 (safe upper bound).
-  const N = faceCount * 3;
-  const edgeToFaces = new Map();
+  // Edge table over typed arrays: the integer pair-keyed map assigns each
+  // unique (va,vb) edge a sequential index in FIRST-OCCURRENCE order, which
+  // matches the old Map's insertion-order iteration exactly. Order matters:
+  // the penalty planes accumulate into per-vertex quadrics with float adds,
+  // so a different edge order would change low bits and shift collapse order.
+  // Arrays are sized to the upper bound (3 edge instances per face).
+  const maxEdges = faceCount * 3;
+  const edgeIdx = new QuantizedPointMap(1, Math.min(maxEdges, 1 << 22));
+  const edgeVa  = new Int32Array(maxEdges);
+  const edgeVb  = new Int32Array(maxEdges);
+  const edgeF0  = new Int32Array(maxEdges);
+  const edgeF1  = new Int32Array(maxEdges);
+  const edgeNum = new Uint8Array(maxEdges); // 1, 2, or 3 (= "more than 2, skip")
+  let edgeCount = 0;
   for (let f = 0; f < faceCount; f++) {
     if (faces[f * 3] < 0) continue;
     for (let e = 0; e < 3; e++) {
       const va = faces[f * 3 + e];
       const vb = faces[f * 3 + ((e + 1) % 3)];
-      const key = va < vb ? va * N + vb : vb * N + va;
-      const existing = edgeToFaces.get(key);
-      if (existing === undefined) {
-        edgeToFaces.set(key, f);
-      } else if (existing >= 0) {
-        edgeToFaces.set(key, -(existing * faceCount + f + 1));
+      const lo = va < vb ? va : vb, hi = va < vb ? vb : va;
+      const ei = edgeIdx.getOrSet(lo, hi, 0, edgeCount);
+      if (edgeIdx.inserted) {
+        edgeVa[ei] = lo; edgeVb[ei] = hi; edgeF0[ei] = f; edgeNum[ei] = 1;
+        edgeCount++;
+      } else if (edgeNum[ei] === 1) {
+        edgeF1[ei] = f; edgeNum[ei] = 2;
+      } else if (edgeNum[ei] === 2) {
+        // 3rd incidence: non-manifold — drop the pair.
+        edgeNum[ei] = 3;
       } else {
-        edgeToFaces.set(key, 0);
+        // 4th+ incidence: replicate the legacy Map encoding exactly. The old
+        // code stored marker 0 on the 3rd incidence, and the 4th re-armed the
+        // pair state as -(0*faceCount + f + 1), i.e. the pair (face 0, f) —
+        // face 0 of the WHOLE MESH, not a face of this edge. Real displaced
+        // meshes do contain 4+-incidence edges (1,726 on the 3DBenchy bench),
+        // so this quirk feeds the crease quadrics and shifts collapse costs.
+        // Deliberately preserved for bit-identical output; fixing it (skip all
+        // 3+-incidence edges) is a separate behaviour change to evaluate on
+        // its own. Odd incidence counts end skipped, even counts end paired.
+        edgeF0[ei] = 0; edgeF1[ei] = f; edgeNum[ei] = 2;
       }
     }
   }
 
   const sqrtW = Math.sqrt(CREASE_WEIGHT);
 
-  for (const [key, val] of edgeToFaces) {
-    if (val >= 0 || val === 0) continue; // nur 1 Face oder >2 Faces -> skip
-    const encoded = -(val + 1);
-    const f0 = Math.floor(encoded / faceCount);
-    const f1 = encoded - f0 * faceCount;
+  for (let ei = 0; ei < edgeCount; ei++) {
+    if (edgeNum[ei] !== 2) continue; // boundary (1 face) or non-manifold (>2) — skip
+    const f0 = edgeF0[ei];
+    const f1 = edgeF1[ei];
     const v0a = faces[f0*3], v0b = faces[f0*3+1], v0c = faces[f0*3+2];
     const v1a = faces[f1*3], v1b = faces[f1*3+1], v1c = faces[f1*3+2];
 
-    const [n0x, n0y, n0z] = faceNormal(
-      positions[v0a*3], positions[v0a*3+1], positions[v0a*3+2],
-      positions[v0b*3], positions[v0b*3+1], positions[v0b*3+2],
-      positions[v0c*3], positions[v0c*3+1], positions[v0c*3+2]
-    );
-    const [n1x, n1y, n1z] = faceNormal(
-      positions[v1a*3], positions[v1a*3+1], positions[v1a*3+2],
-      positions[v1b*3], positions[v1b*3+1], positions[v1b*3+2],
-      positions[v1c*3], positions[v1c*3+1], positions[v1c*3+2]
-    );
+    // Unit face normals, inlined (same arithmetic as faceNormal, no per-edge
+    // array allocation).
+    let ux = positions[v0b*3] - positions[v0a*3], uy = positions[v0b*3+1] - positions[v0a*3+1], uz = positions[v0b*3+2] - positions[v0a*3+2];
+    let vx = positions[v0c*3] - positions[v0a*3], vy = positions[v0c*3+1] - positions[v0a*3+1], vz = positions[v0c*3+2] - positions[v0a*3+2];
+    let cnx = uy * vz - uz * vy, cny = uz * vx - ux * vz, cnz = ux * vy - uy * vx;
+    let clen = Math.sqrt(cnx * cnx + cny * cny + cnz * cnz) || 1;
+    const n0x = cnx / clen, n0y = cny / clen, n0z = cnz / clen;
+
+    ux = positions[v1b*3] - positions[v1a*3]; uy = positions[v1b*3+1] - positions[v1a*3+1]; uz = positions[v1b*3+2] - positions[v1a*3+2];
+    vx = positions[v1c*3] - positions[v1a*3]; vy = positions[v1c*3+1] - positions[v1a*3+1]; vz = positions[v1c*3+2] - positions[v1a*3+2];
+    cnx = uy * vz - uz * vy; cny = uz * vx - ux * vz; cnz = ux * vy - uy * vx;
+    clen = Math.sqrt(cnx * cnx + cny * cny + cnz * cnz) || 1;
+    const n1x = cnx / clen, n1y = cny / clen, n1z = cnz / clen;
 
     if (n0x*n1x + n0y*n1y + n0z*n1z >= CREASE_COS) continue; // smooth — skip
 
-    // Resolve the two vertex indices from the numeric key
-    const va = Math.floor(key / N);
-    const vb = key - va * N;
+    const va = edgeVa[ei];
+    const vb = edgeVb[ei];
 
     // Normalised edge direction
     const ex = positions[vb*3]   - positions[va*3];
@@ -497,8 +505,10 @@ function addCreaseQuadrics(quadrics, positions, faces, faceCount) {
     const elen = Math.sqrt(ex*ex + ey*ey + ez*ez) || 1;
     const edx = ex / elen, edy = ey / elen, edz = ez / elen;
 
-    // Add one penalty plane per adjacent face-normal
-    for (const [nx, ny, nz] of [[n0x, n0y, n0z], [n1x, n1y, n1z]]) {
+    // Add one penalty plane per adjacent face-normal (n0 first, then n1 —
+    // same order as the old destructured-pair loop).
+    for (let pi = 0; pi < 2; pi++) {
+      const nx = pi === 0 ? n0x : n1x, ny = pi === 0 ? n0y : n1y, nz = pi === 0 ? n0z : n1z;
       // Penalty plane normal = normalize(face_normal × edge_dir)
       // This plane contains the edge and is perpendicular to the face,
       // so it constrains the vertex to lie on the crease line.
@@ -520,11 +530,13 @@ function initQuadrics(quadrics, positions, faces, faceCount) {
   for (let f = 0; f < faceCount; f++) {
     if (faces[f * 3] < 0) continue;
     const fa = faces[f * 3], fb = faces[f * 3 + 1], fc = faces[f * 3 + 2];
-    const [nx, ny, nz] = faceNormal(
-      positions[fa*3], positions[fa*3+1], positions[fa*3+2],
-      positions[fb*3], positions[fb*3+1], positions[fb*3+2],
-      positions[fc*3], positions[fc*3+1], positions[fc*3+2]
-    );
+    // Unit face normal, inlined (same arithmetic as the old faceNormal helper,
+    // no per-face array allocation).
+    const ux = positions[fb*3] - positions[fa*3], uy = positions[fb*3+1] - positions[fa*3+1], uz = positions[fb*3+2] - positions[fa*3+2];
+    const vx = positions[fc*3] - positions[fa*3], vy = positions[fc*3+1] - positions[fa*3+1], vz = positions[fc*3+2] - positions[fa*3+2];
+    const cnx = uy * vz - uz * vy, cny = uz * vx - ux * vz, cnz = ux * vy - uy * vx;
+    const len = Math.sqrt(cnx * cnx + cny * cny + cnz * cnz) || 1;
+    const nx = cnx / len, ny = cny / len, nz = cnz / len;
     const d = -(nx * positions[fa*3] + ny * positions[fa*3+1] + nz * positions[fa*3+2]);
     addPlaneQ(quadrics, fa, nx, ny, nz, d);
     addPlaneQ(quadrics, fb, nx, ny, nz, d);
@@ -618,9 +630,10 @@ function pushEdge(heap, quadrics, positions, version, v1, v2) {
 
 // ── Indexed <-> Non-indexed conversion ──────────────────────────────────────
 
-// Numeric spatial-hash vertex deduplication.
-// Avoids template-string allocation by encoding quantised (ix,iy,iz) as a
-// BigInt key: this is still fast because we only call BigInt() once per vertex.
+// Spatial-hash vertex deduplication via the shared integer-keyed point map
+// (open addressing over typed arrays — no BigInt boxing, no Map overhead).
+// Same 1e6 weld grid as before: QuantizedPointMap keys on Math.round(c*QUANT),
+// which groups identically to the old offset-packed BigInt keys.
 function buildIndexed(geometry) {
   const QUANT = QUANT_DEFAULT;
   const posAttr = geometry.attributes.position;
@@ -630,23 +643,16 @@ function buildIndexed(geometry) {
   const indexRemap = new Int32Array(n);
   let   vertCount  = 0;
 
-  const vertMap = new Map();
+  const vertMap = new QuantizedPointMap(QUANT, Math.min(n, 1 << 22));
 
   for (let i = 0; i < n; i++) {
     const x = posAttr.getX(i), y = posAttr.getY(i), z = posAttr.getZ(i);
-    // Encode three 32-bit quantised integers into one BigInt key.
-    // Offset by 2^31 to handle negative coordinates (range ±2147 mm at QUANT=1e6).
-    const ix = Math.round(x * QUANT) + QOFFSET;
-    const iy = Math.round(y * QUANT) + QOFFSET;
-    const iz = Math.round(z * QUANT) + QOFFSET;
-    const key = (BigInt(ix) << 64n) | (BigInt(iy) << 32n) | BigInt(iz);
-    let idx = vertMap.get(key);
-    if (idx === undefined) {
-      idx = vertCount++;
+    const idx = vertMap.getOrSet(x, y, z, vertCount);
+    if (vertMap.inserted) {
+      vertCount++;
       positions[idx * 3]     = x;
       positions[idx * 3 + 1] = y;
       positions[idx * 3 + 2] = z;
-      vertMap.set(key, idx);
     }
     indexRemap[i] = idx;
   }
