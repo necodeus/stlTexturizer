@@ -31,6 +31,7 @@
  */
 
 import { THREE } from './threeCompat.js';
+import { QuantizedPointMap } from './meshIndex.js';
 import { subdivide } from './subdivision.js';
 import { regularizeMesh } from './regularize.js';
 import { applyDisplacement } from './displacement.js';
@@ -76,31 +77,103 @@ function clampBelowBottom(geometry, bottomZ) {
   else geometry.attributes.normal.needsUpdate = true;
 }
 
-// Smooth Bottom: snap every vertex within `tol` of the bottom plane onto it so
-// the bed-contact surface comes out perfectly flat; recompute face normals on
-// touched triangles. (Verbatim from the old main.js snapBottomToFlat.)
+// Smooth Bottom: snap near-bottom vertices onto the bottom plane so the
+// bed-contact surface comes out perfectly flat; recompute face normals on
+// touched triangles.
+//
+// Fold gate (June 2026): the original unconditional band-snap flattened ANY
+// geometry hovering within `tol` of the plane — notably the undersides of
+// texture bumps near the base — folding it coplanar INTO the bottom face.
+// Folded faces overlap the plate, so welded edges there pick up 4 incident
+// faces: non-manifold edges and phantom "disconnected shells" on re-import
+// (measured on the parking rack + dots: 40 nm edges / 39 shells, all at the
+// bottom plane; 0 / 2 with the snap off). The snap is now per-position and
+// gated like a regularize/decimation collapse: all copies of a welded
+// position move together, and the move is REJECTED if any incident triangle
+// would become degenerate or rotate its normal by more than ~75°. Genuine
+// bed-contact slivers — the reason this feature exists — rotate by fractions
+// of a degree and still snap; bump undersides would fold ~90° and stay put.
 export function snapBottomToFlat(geometry, bottomZ, tol = 0.1) {
   const pa = geometry.attributes.position.array;
   const na = geometry.attributes.normal
     ? geometry.attributes.normal.array
     : new Float32Array(pa.length);
-  let dirtyTris = 0;
 
-  for (let i = 0; i < pa.length; i += 9) {
-    let dirty = false;
-    if (Math.abs(pa[i+2] - bottomZ) <= tol) { pa[i+2] = bottomZ; dirty = true; }
-    if (Math.abs(pa[i+5] - bottomZ) <= tol) { pa[i+5] = bottomZ; dirty = true; }
-    if (Math.abs(pa[i+8] - bottomZ) <= tol) { pa[i+8] = bottomZ; dirty = true; }
-    if (dirty) {
-      dirtyTris++;
-      const ux = pa[i+3]-pa[i],   uy = pa[i+4]-pa[i+1], uz = pa[i+5]-pa[i+2];
-      const vx = pa[i+6]-pa[i],   vy = pa[i+7]-pa[i+1], vz = pa[i+8]-pa[i+2];
-      const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
-      const len = Math.sqrt(nx*nx+ny*ny+nz*nz) || 1;
-      na[i]   = na[i+3] = na[i+6] = nx/len;
-      na[i+1] = na[i+4] = na[i+7] = ny/len;
-      na[i+2] = na[i+5] = na[i+8] = nz/len;
+  const vertCount = pa.length / 3;
+  const triCount  = vertCount / 3;
+
+  // Weld positions (1e6 — the decimation grid; copies of one position are
+  // bit-identical at this point) and build per-position incident corner lists.
+  const weld = new QuantizedPointMap(1e6, Math.min(vertCount, 1 << 22));
+  const vid = new Uint32Array(vertCount);
+  let nUnique = 0;
+  for (let i = 0; i < vertCount; i++) {
+    const id = weld.getOrSet(pa[i*3], pa[i*3+1], pa[i*3+2], nUnique);
+    if (weld.inserted) nUnique++;
+    vid[i] = id;
+  }
+  const start = new Uint32Array(nUnique + 1);
+  for (let i = 0; i < vertCount; i++) start[vid[i] + 1]++;
+  for (let id = 0; id < nUnique; id++) start[id + 1] += start[id];
+  const inc = new Uint32Array(vertCount);
+  const cursor = new Uint32Array(nUnique);
+  for (let i = 0; i < vertCount; i++) inc[start[vid[i]] + cursor[vid[i]]++] = i;
+
+  const FOLD_COS = Math.cos(75 * Math.PI / 180);
+  const dirtyTri = new Uint8Array(triCount);
+  const _zs = new Float64Array(3);
+
+  for (let id = 0; id < nUnique; id++) {
+    const first = inc[start[id]];
+    const z = pa[first * 3 + 2];
+    if (z === bottomZ || Math.abs(z - bottomZ) > tol) continue;
+
+    // Gate: simulate moving this position to the plane; every incident
+    // triangle must keep positive area and not fold (normal rotation ≤ ~75°).
+    let ok = true;
+    for (let k = start[id]; k < start[id + 1] && ok; k++) {
+      const t = (inc[k] / 3) | 0;
+      const b = t * 9;
+      const c0 = t * 3;
+      // Post-move z per corner: corners welded to this id land on the plane.
+      for (let v = 0; v < 3; v++) _zs[v] = vid[c0 + v] === id ? bottomZ : pa[b + v * 3 + 2];
+
+      const oux = pa[b+3]-pa[b], ouy = pa[b+4]-pa[b+1], ouz = pa[b+5]-pa[b+2];
+      const ovx = pa[b+6]-pa[b], ovy = pa[b+7]-pa[b+1], ovz = pa[b+8]-pa[b+2];
+      const onx = ouy*ovz - ouz*ovy, ony = ouz*ovx - oux*ovz, onz = oux*ovy - ouy*ovx;
+
+      const nuz = _zs[1] - _zs[0], nvz = _zs[2] - _zs[0];
+      const nnx = ouy*nvz - nuz*ovy, nny = nuz*ovx - oux*nvz, nnz = oux*ovy - ouy*ovx;
+
+      const o2 = onx*onx + ony*ony + onz*onz;
+      const n2 = nnx*nnx + nny*nny + nnz*nnz;
+      if (n2 < 1e-20) { ok = false; break; }      // would collapse to zero area
+      if (o2 < 1e-20) continue;                    // already degenerate — can't judge rotation
+      const dot = onx*nnx + ony*nny + onz*nnz;
+      if (dot < 0 || dot * dot < FOLD_COS * FOLD_COS * o2 * n2) ok = false; // would fold
     }
+    if (!ok) continue;
+
+    // Apply: snap all copies of this position; mark incident triangles dirty.
+    for (let k = start[id]; k < start[id + 1]; k++) {
+      pa[inc[k] * 3 + 2] = bottomZ;
+      dirtyTri[(inc[k] / 3) | 0] = 1;
+    }
+  }
+
+  // Recompute face normals on touched triangles.
+  let dirtyTris = 0;
+  for (let t = 0; t < triCount; t++) {
+    if (!dirtyTri[t]) continue;
+    dirtyTris++;
+    const i = t * 9;
+    const ux = pa[i+3]-pa[i],   uy = pa[i+4]-pa[i+1], uz = pa[i+5]-pa[i+2];
+    const vx = pa[i+6]-pa[i],   vy = pa[i+7]-pa[i+1], vz = pa[i+8]-pa[i+2];
+    const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
+    const len = Math.sqrt(nx*nx+ny*ny+nz*nz) || 1;
+    na[i]   = na[i+3] = na[i+6] = nx/len;
+    na[i+1] = na[i+4] = na[i+7] = ny/len;
+    na[i+2] = na[i+5] = na[i+8] = nz/len;
   }
 
   if (dirtyTris > 0) {
