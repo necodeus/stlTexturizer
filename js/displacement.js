@@ -600,6 +600,15 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
 /**
  * Sample a greyscale value (0–1) from raw RGBA ImageData using
  * bilinear interpolation. UV is tiled via mod 1.
+ *
+ * GL-exact (June 2026): texel centers sit at (i + 0.5) / w and the bilinear
+ * neighbourhood WRAPS — matching texture2D with RepeatWrapping, which is what
+ * the GPU preview shader samples. The previous u * (w - 1) mapping with
+ * clamped neighbours stretched each tile by one texel, so at every tile
+ * boundary the texture's first and last texel column both appeared ("start
+ * and end overlap") and the bilinear blend never wrapped — a visible seam
+ * groove on the exported mesh that the preview (correctly wrapping on the
+ * GPU) never showed.
  */
 function sampleBilinear(data, w, h, u, v) {
   // Ensure [0,1) — guard against floating-point edge cases
@@ -609,14 +618,16 @@ function sampleBilinear(data, w, h, u, v) {
   // v=0 is the bottom of the image, but ImageData row 0 is the top).
   v = 1 - v;
 
-  const fx = u * (w - 1);
-  const fy = v * (h - 1);
-  const x0 = Math.floor(fx);
-  const y0 = Math.floor(fy);
-  const x1 = Math.min(x0 + 1, w - 1);
-  const y1 = Math.min(y0 + 1, h - 1);
+  const fx = u * w - 0.5;
+  const fy = v * h - 0.5;
+  let x0 = Math.floor(fx);
+  let y0 = Math.floor(fy);
   const tx = fx - x0;
   const ty = fy - y0;
+  const x1 = (x0 + 1 + w) % w;
+  const y1 = (y0 + 1 + h) % h;
+  x0 = ((x0 % w) + w) % w;
+  y0 = ((y0 % h) + h) % h;
 
   // Red channel — image is greyscale so R == G == B
   const v00 = data[(y0 * w + x0) * 4] / 255;
