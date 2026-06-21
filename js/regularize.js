@@ -99,11 +99,20 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
   const pa = geometry.attributes.position.array;
   const triCount = pa.length / 9;
 
+  // Per-vertex layer-membership weights (multi-texture). Carried through the
+  // collapse + compaction so the second subdivision pass can re-thread + re-
+  // interpolate them. Per-vertex (not per-face like excludeWeight) so the blend
+  // gradient survives; merged sharp-seam positions keep the first value.
+  const inLW = geometry.attributes.layerWeights || null;
+  const lwK  = inLW ? inLW.itemSize : 0;
+  const inLWarr = inLW ? inLW.array : null;
+
   const posMap = new QuantizedPointMap(QUANTISE, Math.min(triCount * 3, 1 << 22));
   // Vertex coordinates in growable typed arrays (Float64 — JS-number math
   // below must match the previous plain-array behaviour exactly).
   let vcap = Math.min(Math.max(1 << 16, triCount), triCount * 3);
   let vertX = new Float64Array(vcap), vertY = new Float64Array(vcap), vertZ = new Float64Array(vcap);
+  let vertLW = lwK ? new Float64Array(vcap * lwK) : null;
   let nextVid = 0;
   const corners = new Int32Array(triCount * 3);
   for (let i = 0; i < triCount * 3; i++) {
@@ -115,8 +124,10 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
         const gx = new Float64Array(vcap); gx.set(vertX); vertX = gx;
         const gy = new Float64Array(vcap); gy.set(vertY); vertY = gy;
         const gz = new Float64Array(vcap); gz.set(vertZ); vertZ = gz;
+        if (vertLW) { const gl = new Float64Array(vcap * lwK); gl.set(vertLW); vertLW = gl; }
       }
       vertX[nextVid] = x; vertY[nextVid] = y; vertZ[nextVid] = z;
+      if (vertLW) for (let k = 0; k < lwK; k++) vertLW[nextVid * lwK + k] = inLWarr[i * lwK + k];
       nextVid++;
     }
     corners[i] = id;
@@ -308,6 +319,7 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
   const survivingTriCount = triCount - countDeleted();
   const outPositions = new Float32Array(survivingTriCount * 9);
   const outParents   = new Int32Array(survivingTriCount);
+  const outLW        = vertLW ? new Float32Array(survivingTriCount * 3 * lwK) : null;
   let oi = 0;
   for (let t = 0; t < triCount; t++) {
     if (triDeleted[t]) continue;
@@ -315,6 +327,13 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
     outPositions[oi*9]   = vertX[a]; outPositions[oi*9+1] = vertY[a]; outPositions[oi*9+2] = vertZ[a];
     outPositions[oi*9+3] = vertX[b]; outPositions[oi*9+4] = vertY[b]; outPositions[oi*9+5] = vertZ[b];
     outPositions[oi*9+6] = vertX[c]; outPositions[oi*9+7] = vertY[c]; outPositions[oi*9+8] = vertZ[c];
+    if (outLW) {
+      const tri = [a, b, c];
+      for (let v = 0; v < 3; v++) {
+        const src = tri[v] * lwK, dst = (oi * 3 + v) * lwK;
+        for (let k = 0; k < lwK; k++) outLW[dst + k] = vertLW[src + k];
+      }
+    }
     outParents[oi] = newParentId[t];
     oi++;
   }
@@ -322,6 +341,7 @@ export function regularizeMesh(geometry, faceParentId, maxEdgeLength, opts = {})
   const outGeo = new THREE.BufferGeometry();
   outGeo.setAttribute('position', new THREE.BufferAttribute(outPositions, 3));
   outGeo.computeVertexNormals();
+  if (outLW) outGeo.setAttribute('layerWeights', new THREE.BufferAttribute(outLW, lwK));
 
   // Carry through excludeWeight if input had it (precision masking pipeline)
   const inExcl = geometry.attributes.excludeWeight;

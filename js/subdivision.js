@@ -49,7 +49,7 @@ const SAFETY_CAP = (typeof navigator !== 'undefined' && navigator.deviceMemory >
 // mode only) are optional. Arrays are reallocated on growth, so long-lived
 // references must re-read store fields after any append — cached references
 // remain valid for READS of pre-growth entries (values are copied).
-function makeVertStore(initialCap, hasWeights, hasCanon) {
+function makeVertStore(initialCap, hasWeights, hasCanon, lwK = 0) {
   return {
     cap: initialCap,
     count: 0,
@@ -57,19 +57,25 @@ function makeVertStore(initialCap, hasWeights, hasCanon) {
     nrm: new Float64Array(initialCap * 3),
     wgt: hasWeights ? new Float64Array(initialCap) : null,
     canon: hasCanon ? new Int32Array(initialCap) : null,
+    // Per-vertex layer-membership weights — lwK channels per vertex, threaded
+    // through subdivision in parallel with `wgt` (the exclusion weight). null
+    // unless the caller supplies layer weights (multi-texture export/preview).
+    lwK,
+    lw: lwK ? new Float64Array(initialCap * lwK) : null,
     grow() {
       this.cap *= 2;
       const np = new Float64Array(this.cap * 3); np.set(this.pos); this.pos = np;
       const nn = new Float64Array(this.cap * 3); nn.set(this.nrm); this.nrm = nn;
       if (this.wgt)   { const nw = new Float64Array(this.cap); nw.set(this.wgt);   this.wgt = nw; }
       if (this.canon) { const nc = new Int32Array(this.cap);   nc.set(this.canon); this.canon = nc; }
+      if (this.lw)    { const nl = new Float64Array(this.cap * this.lwK); nl.set(this.lw); this.lw = nl; }
     },
   };
 }
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
-export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights = null, { fast = false } = {}) {
+export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights = null, { fast = false, layerWeights = null, layerCount = 0 } = {}) {
   // Derive per-face exclusion BEFORE toIndexed so we use the untouched
   // non-indexed weights (toIndexed uses MAX-merge which can push boundary
   // vertices to weight 1.0 even on included triangles).
@@ -86,8 +92,8 @@ export async function subdivide(geometry, maxEdgeLength, onProgress, faceWeights
   // Fast mode (preview): simple position-merge, index-based edge keys.
   // Accurate mode (export): cluster-based sharp-edge splitting + canonIdx.
   const indexed = fast
-    ? toIndexedFast(geometry, faceWeights)
-    : toIndexed(geometry, faceWeights);
+    ? toIndexedFast(geometry, faceWeights, layerWeights, layerCount)
+    : toIndexed(geometry, faceWeights, layerWeights, layerCount);
   const { verts, indices } = indexed;
   const posCanonMap = indexed.posCanonMap || null;
 
@@ -384,6 +390,12 @@ function getMidpoint(verts, cache, a, b, posCanonMap) {
   verts.pos[idx*3] = mx; verts.pos[idx*3+1] = my; verts.pos[idx*3+2] = mz;
   verts.nrm[idx*3] = nx / nl; verts.nrm[idx*3+1] = ny / nl; verts.nrm[idx*3+2] = nz / nl;
   if (verts.wgt) verts.wgt[idx] = (verts.wgt[a] + verts.wgt[b]) / 2;
+  if (verts.lw) {
+    const K = verts.lwK;
+    for (let k = 0; k < K; k++) {
+      verts.lw[idx * K + k] = (verts.lw[a * K + k] + verts.lw[b * K + k]) / 2;
+    }
+  }
 
   // Maintain canonical position ids when in accurate (export) mode.
   if (verts.canon) {
@@ -399,15 +411,16 @@ function getMidpoint(verts, cache, a, b, posCanonMap) {
 // Simple position-only merge — no cluster detection, no sharp-edge splitting.
 // Much faster than toIndexed() on high-poly meshes like the 3DBenchy.
 
-function toIndexedFast(geometry, nonIndexedWeights = null) {
+function toIndexedFast(geometry, nonIndexedWeights = null, layerWeights = null, layerCount = 0) {
   const posAttr = geometry.attributes.position;
   const nrmAttr = geometry.attributes.normal;
   const n = posAttr.count;
   const vertMap = new QuantizedPointMap(QUANTISE, Math.min(n, 1 << 22));
   const indices = new Uint32Array(n);
+  const K = layerWeights ? layerCount : 0;
   // nrm accumulates raw normal sums during the merge and is normalised in
   // place afterwards (the pre-normalisation values are never read).
-  const verts = makeVertStore(Math.max(16, Math.min(1 << 16, n)), !!nonIndexedWeights, false);
+  const verts = makeVertStore(Math.max(16, Math.min(1 << 16, n)), !!nonIndexedWeights, false, K);
 
   for (let i = 0; i < n; i++) {
     const px = posAttr.getX(i);
@@ -423,6 +436,7 @@ function toIndexedFast(geometry, nonIndexedWeights = null) {
       verts.pos[idx*3] = px; verts.pos[idx*3+1] = py; verts.pos[idx*3+2] = pz;
       verts.nrm[idx*3] = nx_; verts.nrm[idx*3+1] = ny_; verts.nrm[idx*3+2] = nz_;
       if (verts.wgt) verts.wgt[idx] = nonIndexedWeights[i];
+      if (K) for (let k = 0; k < K; k++) verts.lw[idx * K + k] = layerWeights[i * K + k];
       verts.count++;
     } else {
       verts.nrm[idx * 3]     += nx_;
@@ -430,6 +444,10 @@ function toIndexedFast(geometry, nonIndexedWeights = null) {
       verts.nrm[idx * 3 + 2] += nz_;
       if (verts.wgt && nonIndexedWeights[i] > verts.wgt[idx]) {
         verts.wgt[idx] = nonIndexedWeights[i];
+      }
+      if (K) for (let k = 0; k < K; k++) {
+        const w = layerWeights[i * K + k];
+        if (w > verts.lw[idx * K + k]) verts.lw[idx * K + k] = w;
       }
     }
     indices[i] = idx;
@@ -459,9 +477,10 @@ function normalizeStoreNormals(verts) {
 // weight = 1.0 if its triangle (floor(i/3)) is user-excluded, else 0.
 // When multiple original vertices map to the same indexed vertex, the MAX
 // weight wins (conservative: any excluded face marks the shared vertex).
-function toIndexed(geometry, nonIndexedWeights = null) {
+function toIndexed(geometry, nonIndexedWeights = null, layerWeights = null, layerCount = 0) {
   const posAttr = geometry.attributes.position;
   const n = posAttr.count;
+  const K = layerWeights ? layerCount : 0;
 
   // ── Pre-compute per-face normals (unit + raw cross product) ──────────────
   const faceNrmUnit = new Float32Array(n * 3);
@@ -498,7 +517,7 @@ function toIndexed(geometry, nonIndexedWeights = null) {
   const indices = new Uint32Array(n);
   // nrm accumulates raw (area-weighted) normal sums during the merge and is
   // normalised in place afterwards; canon holds the canonical position ids.
-  const verts = makeVertStore(Math.max(16, Math.min(1 << 16, n)), !!nonIndexedWeights, true);
+  const verts = makeVertStore(Math.max(16, Math.min(1 << 16, n)), !!nonIndexedWeights, true, K);
   // position → first vertex idx at that position (canonical ID)
   const posCanonMap = new QuantizedPointMap(QUANTISE, Math.min(n, 1 << 22));
   // canonical ID → [{idx, fnU: [x,y,z]}] smooth-group clusters at that position
@@ -527,6 +546,10 @@ function toIndexed(geometry, nonIndexedWeights = null) {
           if (verts.wgt && nonIndexedWeights[i] > verts.wgt[idx]) {
             verts.wgt[idx] = nonIndexedWeights[i];
           }
+          if (K) for (let k = 0; k < K; k++) {
+            const w = layerWeights[i * K + k];
+            if (w > verts.lw[idx * K + k]) verts.lw[idx * K + k] = w;
+          }
           // Update the cluster representative to the running average direction
           // so gradual curvature on smooth surfaces (benchy hull, cylinders)
           // stays in one cluster instead of fragmenting when faces far from the
@@ -548,6 +571,7 @@ function toIndexed(geometry, nonIndexedWeights = null) {
         verts.pos[idx*3] = px;   verts.pos[idx*3+1] = py;   verts.pos[idx*3+2] = pz;
         verts.nrm[idx*3] = fnRx; verts.nrm[idx*3+1] = fnRy; verts.nrm[idx*3+2] = fnRz;
         if (verts.wgt) verts.wgt[idx] = nonIndexedWeights[i];
+        if (K) for (let k = 0; k < K; k++) verts.lw[idx * K + k] = layerWeights[i * K + k];
         verts.canon[idx] = canonId;  // same canonical position ID
         verts.count++;
         clusters.push({idx, fnU: [fnUx, fnUy, fnUz]});
@@ -559,6 +583,7 @@ function toIndexed(geometry, nonIndexedWeights = null) {
       verts.pos[idx*3] = px;   verts.pos[idx*3+1] = py;   verts.pos[idx*3+2] = pz;
       verts.nrm[idx*3] = fnRx; verts.nrm[idx*3+1] = fnRy; verts.nrm[idx*3+2] = fnRz;
       if (verts.wgt) verts.wgt[idx] = nonIndexedWeights[i];
+      if (K) for (let k = 0; k < K; k++) verts.lw[idx * K + k] = layerWeights[i * K + k];
       verts.canon[idx] = canonId;
       verts.count++;
       clustersByCanon.set(canonId, [{idx, fnU: [fnUx, fnUy, fnUz]}]);
@@ -574,10 +599,14 @@ function toIndexed(geometry, nonIndexedWeights = null) {
 
 function toNonIndexed(verts, indices, faceExcluded = null) {
   const positions = verts.pos, normals = verts.nrm, weights = verts.wgt;
+  const lw = verts.lw, lwK = verts.lwK || 0;
   const triCount  = indices.length / 3;
   const posArray  = new Float32Array(triCount * 9);
   const nrmArray  = new Float32Array(triCount * 9);
   const wgtArray  = (faceExcluded || weights) ? new Float32Array(triCount * 3) : null;
+  // Layer weights use the INTERPOLATED per-vertex values (smooth blend bands),
+  // unlike excludeWeight which uses the hard per-face flag.
+  const lwArray   = lw ? new Float32Array(triCount * 3 * lwK) : null;
 
   for (let t = 0; t < triCount; t++) {
     // Use the binary faceExcluded flag (tracked accurately through subdivision)
@@ -598,6 +627,10 @@ function toNonIndexed(verts, indices, faceExcluded = null) {
       nrmArray[t * 9 + v * 3 + 2] = normals[vidx * 3 + 2];
 
       if (wgtArray) wgtArray[t * 3 + v] = faceW !== null ? faceW : weights[vidx];
+      if (lwArray) {
+        const dst = (t * 3 + v) * lwK, src = vidx * lwK;
+        for (let k = 0; k < lwK; k++) lwArray[dst + k] = lw[src + k];
+      }
     }
   }
 
@@ -605,5 +638,6 @@ function toNonIndexed(verts, indices, faceExcluded = null) {
   geo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
   geo.setAttribute('normal',   new THREE.BufferAttribute(nrmArray, 3));
   if (wgtArray) geo.setAttribute('excludeWeight', new THREE.BufferAttribute(wgtArray, 1));
+  if (lwArray)  geo.setAttribute('layerWeights',  new THREE.BufferAttribute(lwArray, lwK));
   return geo;
 }

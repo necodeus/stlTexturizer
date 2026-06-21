@@ -21,8 +21,10 @@ let wireframeLines = null;   // LineSegments overlay, or null when hidden
 let wireframeVisible = false;
 let exclusionMesh = null;    // flat orange overlay for user-excluded faces
 let hoverMesh = null;        // semi-transparent yellow bucket-fill preview
+let layerOverlayMesh = null; // per-layer color overlay (vertex colors)
 let _exclMaterial = null;
 let _hoverMaterial = null;
+let _layerOverlayMaterial = null;
 let _needsRender = true;
 let _diagEdges = null;       // LineSegments2 for open/non-manifold edges
 let _diagFaces = [];         // Array of THREE.Mesh overlays for face highlights
@@ -745,6 +747,39 @@ export function setExclusionOverlay(overlayGeo, color = 0xff6600, opacity = 1.0)
   exclusionMesh = new THREE.Mesh(overlayGeo, _exclMaterial);
   exclusionMesh.renderOrder = 1;
   scene.add(exclusionMesh);
+  requestRender();
+}
+
+/**
+ * Replace (or clear) the per-layer color overlay that visualises which faces
+ * are assigned to which texture layer. Uses per-vertex colors so a single mesh
+ * shows all layers at once. Pass null/empty to clear.
+ *
+ * @param {THREE.BufferGeometry|null} overlayGeo  geometry with a `color` attribute
+ */
+export function setLayerOverlay(overlayGeo, opacity = 0.55) {
+  if (layerOverlayMesh) {
+    scene.remove(layerOverlayMesh);
+    layerOverlayMesh.geometry.dispose();
+    layerOverlayMesh = null;
+  }
+  if (!overlayGeo || overlayGeo.attributes.position.count === 0) { requestRender(); return; }
+  if (!_layerOverlayMaterial) {
+    _layerOverlayMaterial = new THREE.MeshBasicMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+  } else {
+    _layerOverlayMaterial.opacity = opacity;
+  }
+  layerOverlayMesh = new THREE.Mesh(overlayGeo, _layerOverlayMaterial);
+  layerOverlayMesh.renderOrder = 1;
+  scene.add(layerOverlayMesh);
   requestRender();
 }
 

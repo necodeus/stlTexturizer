@@ -35,6 +35,23 @@ import { QuantizedPointMap } from './meshIndex.js';
 import { subdivide } from './subdivision.js';
 import { regularizeMesh } from './regularize.js';
 import { applyDisplacement } from './displacement.js';
+
+// Hard per-face layer weights from a subdivided→original face map. Inlined here
+// (not imported from exclusion.js) because this module also runs in the export
+// worker, where exclusion.js's bare `import 'three'` would fail to resolve.
+function buildLayerWeightsFromParents(subTriCount, faceParentId, faceChannel, K) {
+  const weights = new Float32Array(subTriCount * 3 * K);
+  for (let f = 0; f < subTriCount; f++) {
+    const parent = faceParentId ? faceParentId[f] : f;
+    const ch = (parent >= 0 && parent < faceChannel.length) ? faceChannel[parent] : -1;
+    if (ch < 0) continue;
+    const base = f * 3 * K;
+    weights[base + ch]         = 1;
+    weights[base + K + ch]     = 1;
+    weights[base + 2 * K + ch] = 1;
+  }
+  return weights;
+}
 import { decimate } from './decimation.js';
 import { resolveTJunctions, countEdgeDefects, countAreaSlivers } from './meshRepair.js';
 
@@ -215,15 +232,12 @@ export async function runExportPipeline(input, onEvent = () => {}, shouldAbort =
     if (shouldAbort()) return null;
 
     // Regularize sub-slivers, then re-subdivide stretched edges. Skipped when
-    // the Advanced toggle is off. Export mode passes a zero parent map (it
-    // doesn't consume parents); bake mode threads + composes the real one.
+    // the Advanced toggle is off. faceParentId is composed through both passes
+    // (in every mode) so the hard per-face layer weights can be rebuilt below.
     if (settings.regularizeEnabled) {
       onEvent('regularize', 0);
       await yieldFrame();
-      const regParents = mode === 'bake'
-        ? faceParentId
-        : new Int32Array(subdivided.attributes.position.count / 3);
-      const reg = regularizeMesh(subdivided, regParents, settings.refineLength, regularizeOpts);
+      const reg = regularizeMesh(subdivided, faceParentId, settings.refineLength, regularizeOpts);
       subdivided.dispose();
       const exclAttr = reg.geometry.attributes.excludeWeight;
       const secondPassWeights = exclAttr ? exclAttr.array : null;
@@ -233,18 +247,22 @@ export async function runExportPipeline(input, onEvent = () => {}, shouldAbort =
         secondPassWeights, { fast: false }
       );
       reg.geometry.dispose();
-      if (mode === 'bake') {
-        const composed = new Int32Array(resubParents.length);
-        for (let i = 0; i < resubParents.length; i++) {
-          composed[i] = reg.faceParentId[resubParents[i]];
-        }
-        faceParentId = composed;
+      const composed = new Int32Array(resubParents.length);
+      for (let i = 0; i < resubParents.length; i++) {
+        composed[i] = reg.faceParentId[resubParents[i]];
       }
+      faceParentId = composed;
       subdivided = resub;
     }
     if (shouldAbort()) return null;
 
     const subTriCount = subdivided.attributes.position.count / 3;
+    // Hard per-face layer weights from the composed parent map — bleed-free
+    // (a painted region textures exactly its faces, no shared-vertex spread).
+    if (input.layerFaceChannel && input.layerCount > 0) {
+      const lw = buildLayerWeightsFromParents(subTriCount, faceParentId, input.layerFaceChannel, input.layerCount);
+      subdivided.setAttribute('layerWeights', new THREE.BufferAttribute(lw, input.layerCount));
+    }
     onEvent('displace', 0, { triCount: subTriCount });
     await yieldFrame();
     displaced = applyDisplacement(
@@ -254,7 +272,8 @@ export async function runExportPipeline(input, onEvent = () => {}, shouldAbort =
       input.imgHeight,
       settings,
       bounds,
-      (p) => onEvent('displace', p, { triCount: subTriCount })
+      (p) => onEvent('displace', p, { triCount: subTriCount }),
+      input.layerData || null
     );
     if (shouldAbort()) return null;
 

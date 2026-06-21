@@ -209,6 +209,131 @@ export function buildExclusionOverlayGeo(geometry, faceSet, invert = false) {
   return geo;
 }
 
+// ── Per-layer weight channels (for subdivision threading) ────────────────────
+
+/**
+ * Build one-hot per-vertex layer-membership weights for a non-indexed geometry.
+ *
+ * Channel k corresponds to layers[k]. Every layer (Layer 1 included) is
+ * paint-driven: a face is textured only by the layer whose faceSet contains it.
+ * Faces not painted by ANY layer get all-zero weights → no texture (the bake /
+ * preview produce zero displacement there, so the model stays flat). Regions are
+ * disjoint, so the last layer that claims a face wins.
+ * subdivision.js threads these channels through edge splits via linear
+ * interpolation, producing a smooth 0→1 blend band one original-edge wide at
+ * each region boundary (sharp dihedral edges stay hard).
+ *
+ * @param {THREE.BufferGeometry} geometry  – non-indexed
+ * @param {Array<{faceSet:Set<number>}>} layers
+ * @returns {{ weights: Float32Array, layerCount: number }}
+ *          weights length = position.count × layerCount (K channels per vertex)
+ */
+/**
+ * Per-original-face channel map: faceChannel[f] = the layer index that paints
+ * face f, or -1 if unpainted. Disjoint regions, last layer wins.
+ */
+export function buildFaceChannels(layers, triCount) {
+  const fc = new Int32Array(triCount).fill(-1);
+  for (let ch = 0; ch < layers.length; ch++) {
+    const fs = layers[ch].faceSet;
+    if (!fs) continue;
+    for (const f of fs) if (f >= 0 && f < triCount) fc[f] = ch;
+  }
+  return fc;
+}
+
+/**
+ * Build HARD per-face layer weights for a SUBDIVIDED geometry, from the
+ * subdivided→original face map (faceParentId) and the original faceChannel.
+ * Each subdivided face's 3 vertices get the one-hot of its parent's layer
+ * (or all-zero if the parent is unpainted). This is bleed-free: a painted
+ * region textures exactly its faces and no neighbours, unlike the welded
+ * vertex-interpolation path which spreads weight across shared vertices on
+ * coarse meshes.
+ *
+ * @returns {Float32Array} length = subTriCount × 3 × K
+ */
+export function buildLayerWeightsFromParents(subTriCount, faceParentId, faceChannel, K) {
+  const weights = new Float32Array(subTriCount * 3 * K);
+  for (let f = 0; f < subTriCount; f++) {
+    const parent = faceParentId ? faceParentId[f] : f;
+    const ch = (parent >= 0 && parent < faceChannel.length) ? faceChannel[parent] : -1;
+    if (ch < 0) continue;
+    const base = f * 3 * K;
+    weights[base + ch]         = 1;
+    weights[base + K + ch]     = 1;
+    weights[base + 2 * K + ch] = 1;
+  }
+  return weights;
+}
+
+export function buildLayerWeights(geometry, layers) {
+  const count    = geometry.attributes.position.count;
+  const triCount = count / 3;
+  const K        = Math.max(1, layers.length);
+  const weights  = new Float32Array(count * K);
+
+  // Resolve each face to its owning channel; -1 = unpainted → no texture.
+  const faceChannel = new Int32Array(triCount).fill(-1);
+  for (let ch = 0; ch < layers.length; ch++) {
+    const fs = layers[ch].faceSet;
+    if (!fs) continue;
+    for (const f of fs) if (f >= 0 && f < triCount) faceChannel[f] = ch;
+  }
+
+  for (let f = 0; f < triCount; f++) {
+    const ch = faceChannel[f];
+    if (ch < 0) continue;            // unpainted face → all-zero weights (flat)
+    const base = f * 3 * K;
+    weights[base + ch]         = 1; // vertex 0
+    weights[base + K + ch]     = 1; // vertex 1
+    weights[base + 2 * K + ch] = 1; // vertex 2
+  }
+  return { weights, layerCount: K };
+}
+
+// ── Layer overlay geometry ────────────────────────────────────────────────────
+
+/**
+ * Build a vertex-colored overlay geometry highlighting each face by the color
+ * of the layer that owns it. Faces not claimed by any layer's faceSet are
+ * skipped (they belong to the implicit base layer and stay unhighlighted).
+ *
+ * @param {THREE.BufferGeometry} geometry  – non-indexed source geometry
+ * @param {Array<{color:number, faceSet:Set<number>}>} layers
+ * @returns {THREE.BufferGeometry}
+ */
+export function buildLayerOverlayGeo(geometry, layers) {
+  const srcPos = geometry.attributes.position.array;
+  // Count claimed faces (faceSets are disjoint, but guard against double-count).
+  const claimed = new Map(); // faceIdx → color
+  for (const layer of layers) {
+    if (!layer.faceSet || layer.faceSet.size === 0) continue;
+    for (const f of layer.faceSet) claimed.set(f, layer.color);
+  }
+  const count  = claimed.size;
+  const outPos = new Float32Array(count * 9);
+  const outCol = new Float32Array(count * 9);
+  let dst = 0;
+  for (const [f, color] of claimed) {
+    const src = f * 9;
+    outPos.set(srcPos.subarray(src, src + 9), dst);
+    const r = ((color >> 16) & 0xff) / 255;
+    const g = ((color >> 8)  & 0xff) / 255;
+    const b = (color & 0xff) / 255;
+    for (let v = 0; v < 3; v++) {
+      outCol[dst + v * 3]     = r;
+      outCol[dst + v * 3 + 1] = g;
+      outCol[dst + v * 3 + 2] = b;
+    }
+    dst += 9;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
+  geo.setAttribute('color',    new THREE.BufferAttribute(outCol, 3));
+  return geo;
+}
+
 // ── Face-weight array for subdivision ────────────────────────────────────────
 
 /**

@@ -20,7 +20,16 @@ import { QuantizedPointMap } from './meshIndex.js';
  * @param {function}             [onProgress]
  * @returns {THREE.BufferGeometry}  new non-indexed geometry with displaced positions
  */
-export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, settings, bounds, onProgress) {
+/**
+ * @param {Array<{imageData, imgWidth, imgHeight, settings}>|null} layerData
+ *   When provided AND the geometry carries a `layerWeights` attribute, the
+ *   displacement is the per-vertex weighted sum of every layer's sampled grey
+ *   (× that layer's amplitude), blended by the threaded layer weights. The
+ *   per-layer `settings` should be the global settings with the layer's UV
+ *   transform + texture aspect overridden (projection stays global).
+ *   When null, the single-texture `imageData`/`settings` path runs unchanged.
+ */
+export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, settings, bounds, onProgress, layerData = null) {
   const posAttr = geometry.attributes.position;
   const nrmAttr = geometry.attributes.normal;
   const count   = posAttr.count;
@@ -119,6 +128,29 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
   // Displacement cache: one sample per unique vertex (replaces dispCache Map)
   const dispCacheVal = new Float64Array(uniqueCount);
   const dispCacheSet = new Uint8Array(uniqueCount);
+
+  // ── Multi-texture layers ──────────────────────────────────────────────────
+  // Active only when the caller passes layerData AND subdivision threaded a
+  // `layerWeights` attribute. greyByLayer caches each layer's sampled grey per
+  // unique vertex (geometry-only, deduped); the per-non-indexed layer weights
+  // are read and blended in Pass 3 so sharp seams keep their per-copy weights.
+  const lwAttr   = geometry.attributes.layerWeights || null;
+  const useLayers = !!(layerData && lwAttr && lwAttr.itemSize >= 1);
+  const Klw       = useLayers ? lwAttr.itemSize : 0;
+  const layerCnt  = useLayers ? Math.min(Klw, layerData.length) : 0;
+  const greyByLayer = useLayers ? new Float64Array(uniqueCount * Klw) : null;
+  const lwArr       = useLayers ? lwAttr.array : null;
+  // Precompute each layer's aspect + aspect-augmented settings once.
+  const layerCtx = useLayers ? layerData.map((L) => {
+    const tmax = Math.max(L.imgWidth, L.imgHeight, 1);
+    const aU = tmax / Math.max(L.imgWidth, 1);
+    const aV = tmax / Math.max(L.imgHeight, 1);
+    return {
+      data: L.imageData.data, w: L.imgWidth, h: L.imgHeight,
+      s: L.settings, sa: { ...L.settings, textureAspectU: aU, textureAspectV: aV },
+      aU, aV, amp: L.settings.amplitude,
+    };
+  }) : null;
 
   for (let t = 0; t < count; t += 3) {
     vA.fromBufferAttribute(posAttr, t);
@@ -409,35 +441,15 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     }
   }
 
-  // ── Pass 2: sample displacement texture once per unique position ──────────
-
-  for (let i = 0; i < count; i++) {
-    const vid = vertexId[i];
-    if (dispCacheSet[vid]) continue;
-    dispCacheSet[vid] = 1;
-
-    tmpPos.fromBufferAttribute(posAttr, i);
-
-    // Cubic: derive blend weights from the *smooth* per-vertex normal so that
-    // adjacent vertices on a curved region (small fillets, rolled edges) see
-    // smoothly varying weights — this matches the per-fragment behaviour of
-    // the preview shader. The previous implementation summed per-face zone
-    // weights into per-vertex zoneArea[X|Y|Z]; on small fillets those sums
-    // change abruptly between neighbours because each face's dominant-axis
-    // membership is binary, which produced jagged "needle" displacement.
-    //
-    // The thin-plate edge case (top + bottom face normals cancel at a shared
-    // knife-edge vertex, leaving the smooth normal nearly zero) still needs
-    // the per-face zoneArea path. We detect that via smoothNrmReliability —
-    // length(rawSmoothNormal) / totalFaceArea, in [0, 1]. Surfaces with all
-    // normals broadly aligned read ≈1; perfectly cancelling pairs read 0.
-    // 0.5 is loose enough that a 90° cube edge (≈0.71) still uses the smooth
-    // path, but a near-180° fold falls back to face-area zones.
-    if (settings.mappingMode === 6 /* MODE_CUBIC */) {
+  // Sample one texture's grey at the current tmpPos for unique vertex `vid`,
+  // using `lSettings`'s projection + transform. Mirrors the original inline
+  // logic; extracted so the multi-layer path can call it once per layer.
+  function sampleGrey(vid, lData, lW, lH, lSettings, lSettingsWithAspect, lAspectU, lAspectV) {
+    if (lSettings.mappingMode === 6 /* MODE_CUBIC */) {
       const md = Math.max(bounds.size.x, bounds.size.y, bounds.size.z, 1e-6);
-      const rotRad = (settings.rotation ?? 0) * Math.PI / 180;
-      const cubicBlend = settings.mappingBlend ?? 0;
-      const cubicBandWidth = settings.seamBandWidth ?? 0.35;
+      const rotRad = (lSettings.rotation ?? 0) * Math.PI / 180;
+      const cubicBlend = lSettings.mappingBlend ?? 0;
+      const cubicBandWidth = lSettings.seamBandWidth ?? 0.35;
 
       let wX = 0, wY = 0, wZ = 0;
       if (smoothNrmReliability[vid] > 0.5) {
@@ -452,53 +464,58 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
 
       if (wX + wY + wZ > 0) {
         let grey = 0;
-        // U-flip uses the *original* smoothNrm — it's a discrete sign decision
-        // about which face of the cube this vertex sits on. The smoothed blend
-        // normal can have small components flip sign during Laplacian smoothing
-        // (e.g. for vertices near the equator x≈0), which would mirror their
-        // texture sample relative to the true surface orientation.
         if (wX > 0) { // X-dominant → YZ projection
           let rawU = (tmpPos.y-bounds.min.y)/md;
           if (smoothNrmX[vid] < 0) rawU = -rawU;
-          const uv = _cubicUV(rawU, (tmpPos.z-bounds.min.z)/md, settings, rotRad, aspectU, aspectV);
-          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * wX;
+          const uv = _cubicUV(rawU, (tmpPos.z-bounds.min.z)/md, lSettings, rotRad, lAspectU, lAspectV);
+          grey += sampleBilinear(lData, lW, lH, uv.u, uv.v) * wX;
         }
         if (wY > 0) { // Y-dominant → XZ projection
           let rawU = (tmpPos.x-bounds.min.x)/md;
           if (smoothNrmY[vid] > 0) rawU = -rawU;
-          const uv = _cubicUV(rawU, (tmpPos.z-bounds.min.z)/md, settings, rotRad, aspectU, aspectV);
-          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * wY;
+          const uv = _cubicUV(rawU, (tmpPos.z-bounds.min.z)/md, lSettings, rotRad, lAspectU, lAspectV);
+          grey += sampleBilinear(lData, lW, lH, uv.u, uv.v) * wY;
         }
         if (wZ > 0) { // Z-dominant → XY projection
           let rawU = (tmpPos.x-bounds.min.x)/md;
           if (smoothNrmZ[vid] < 0) rawU = -rawU;
-          const uv = _cubicUV(rawU, (tmpPos.y-bounds.min.y)/md, settings, rotRad, aspectU, aspectV);
-          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, uv.u, uv.v) * wZ;
+          const uv = _cubicUV(rawU, (tmpPos.y-bounds.min.y)/md, lSettings, rotRad, lAspectU, lAspectV);
+          grey += sampleBilinear(lData, lW, lH, uv.u, uv.v) * wZ;
         }
-        dispCacheVal[vid] = grey;
-        continue;
+        return grey;
       }
     }
 
-    // Triplanar / cylindrical seam blends use the SMOOTHED blend normal so
-    // adjacent vertices in a blend zone don't see jittery weights driven by
-    // mesh-noise. Other modes ignore the normal for blending, so this is a
-    // no-op there. Displacement direction (Pass 3) stays on the unsmoothed
-    // smooth normal — only blend weights change here.
     tmpNrm.set(blendNrmX[vid], blendNrmY[vid], blendNrmZ[vid]);
-
-    const uvResult = computeUV(tmpPos, tmpNrm, settings.mappingMode, settingsWithAspect, bounds);
-    let grey;
+    const uvResult = computeUV(tmpPos, tmpNrm, lSettings.mappingMode, lSettingsWithAspect, bounds);
     if (uvResult.triplanar) {
-      grey = 0;
-      for (const s of uvResult.samples) {
-        grey += sampleBilinear(imageData.data, imgWidth, imgHeight, s.u, s.v) * s.w;
-      }
-    } else {
-      grey = sampleBilinear(imageData.data, imgWidth, imgHeight, uvResult.u, uvResult.v);
+      let grey = 0;
+      for (const s of uvResult.samples) grey += sampleBilinear(lData, lW, lH, s.u, s.v) * s.w;
+      return grey;
     }
-    dispCacheVal[vid] = grey;
+    return sampleBilinear(lData, lW, lH, uvResult.u, uvResult.v);
   }
+
+  // ── Pass 2: sample displacement texture once per unique position ──────────
+
+  for (let i = 0; i < count; i++) {
+    const vid = vertexId[i];
+    if (dispCacheSet[vid]) continue;
+    dispCacheSet[vid] = 1;
+
+    tmpPos.fromBufferAttribute(posAttr, i);
+
+    if (useLayers) {
+      for (let k = 0; k < layerCnt; k++) {
+        const c = layerCtx[k];
+        greyByLayer[vid * Klw + k] = sampleGrey(vid, c.data, c.w, c.h, c.s, c.sa, c.aU, c.aV);
+      }
+      continue;
+    }
+
+    dispCacheVal[vid] = sampleGrey(vid, imageData.data, imgWidth, imgHeight, settings, settingsWithAspect, aspectU, aspectV);
+  }
+
 
   // ── Pass 3: displace every vertex copy by the same vector ─────────────────
   // Using the smooth normal for the displacement direction ensures all copies
@@ -511,7 +528,6 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     tmpNrm.fromBufferAttribute(nrmAttr, i);
 
     const vid  = vertexId[i];
-    const grey = dispCacheVal[vid];
 
     // User-excluded faces get zero displacement; only angle-based masking uses
     // the smooth per-vertex blend so neighbours are never unintentionally dimmed.
@@ -522,9 +538,32 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     const isSealedBoundary = !isFaceExcluded && excludedPos && excludedPos[vid] === 1;
     const mfTotal = maskedFracTotal[vid];
     const maskedFrac = mfTotal > 0 ? maskedFracMasked[vid] / mfTotal : 0;
-    const centeredGrey = settings.symmetricDisplacement ? (grey - 0.5) : grey;
     const falloffFactor = falloffArr ? falloffArr[vid] : 1.0;
-    const disp = (isFaceExcluded || isSealedBoundary) ? 0 : falloffFactor * (1 - maskedFrac) * centeredGrey * settings.amplitude;
+
+    // Effective displacement scalar (already includes symmetric centring and
+    // amplitude). Multi-layer: weighted sum of each layer's grey × its
+    // amplitude, using the per-non-indexed-vertex layer weights (normalised).
+    let effScalar;
+    if (useLayers) {
+      const lwBase = i * Klw;
+      let sum = 0;
+      for (let k = 0; k < layerCnt; k++) sum += lwArr[lwBase + k];
+      let acc = 0;
+      if (sum > 1e-8) {
+        for (let k = 0; k < layerCnt; k++) {
+          const wk = lwArr[lwBase + k];
+          if (wk <= 0) continue;
+          const g  = greyByLayer[vid * Klw + k];
+          const cg = settings.symmetricDisplacement ? (g - 0.5) : g;
+          acc += (wk / sum) * cg * layerCtx[k].amp;
+        }
+      }
+      effScalar = acc;
+    } else {
+      const grey = dispCacheVal[vid];
+      effScalar = (settings.symmetricDisplacement ? (grey - 0.5) : grey) * settings.amplitude;
+    }
+    const disp = (isFaceExcluded || isSealedBoundary) ? 0 : falloffFactor * (1 - maskedFrac) * effScalar;
 
     const newX = tmpPos.x + smoothNrmX[vid] * disp;
     const newY = tmpPos.y + smoothNrmY[vid] * disp;

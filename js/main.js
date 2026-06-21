@@ -1,20 +1,23 @@
 import * as THREE from 'three';
 import { initViewer, loadGeometry, setMeshMaterial, setMeshGeometry, setWireframe,
          getControls, getCamera, getCurrentMesh,
-         setExclusionOverlay, setHoverPreview, setViewerTheme,
+         setExclusionOverlay, setHoverPreview, setLayerOverlay, setViewerTheme,
          setProjection, requestRender,
          clearDiagOverlays, setDiagEdges, addDiagFaces,
          setRotationGizmo, isGizmoDragging } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount }  from './stlLoader.js';
 import { computeSmartResolution } from './smartResolution.js';
 import { loadAllThumbnails, loadFullPreset, loadCustomTexture, IMAGE_PRESETS }  from './presetTextures.js';
-import { createPreviewMaterial, updateMaterial } from './previewMaterial.js';
+import { MAX_LAYERS, createLayer, extractUV, findLayer,
+         syncSettingsFromLayer, syncLayerFromSettings, claimFace } from './layers.js';
+import { createPreviewMaterial, updateMaterial, applyLayerUniforms } from './previewMaterial.js';
 import { subdivide }          from './subdivision.js';
 import { regularizeMesh }     from './regularize.js';
 import { runExportPipeline }  from './exportPipeline.js';
 import { exportSTL, export3MF } from './exporter.js';
 import { buildAdjacency, bucketFill,
-         buildExclusionOverlayGeo, buildFaceWeights } from './exclusion.js';
+         buildExclusionOverlayGeo, buildFaceWeights, buildLayerOverlayGeo,
+         buildLayerWeights, buildFaceChannels, buildLayerWeightsFromParents } from './exclusion.js';
 import { runFastDiagnostics, runExpensiveDiagnostics,
          getEdgePositions, getShellAssignments } from './meshValidation.js';
 import { t, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
@@ -116,6 +119,238 @@ const settings = {
   regularizeAggressiveNormalDeg: 25,
   regularizeSecondPassMul:   1.1,
 };
+
+// ── Texture layers ────────────────────────────────────────────────────────────
+// Multi-texture model. The active layer mirrors its UV params into `settings`
+// (so the existing slider wiring keeps writing into settings.*), and its
+// texture into `activeMapEntry`. See js/layers.js.
+let layers        = [ createLayer({ name: 'Layer 1', uv: extractUV(settings) }) ];
+let activeLayerId = layers[0].id;
+// layerWeightsA/B vertex attributes are rebuilt only when assignments change.
+let _layerAttrsDirty = true;
+
+function getActiveLayer() { return findLayer(layers, activeLayerId); }
+
+/** Set the active texture, keeping the active layer's mapEntry in sync. */
+function setActiveMapEntry(entry) {
+  activeMapEntry = entry;
+  const al = getActiveLayer();
+  if (al) al.mapEntry = entry;
+  renderLayerList();
+}
+
+// ── Layer UI / switching ──────────────────────────────────────────────────────
+
+/** Push the per-layer UV fields from `settings` into their UI controls. */
+function refreshUVControls() {
+  mappingSelect.value = String(settings.mappingMode);
+  capAngleRow.style.display = settings.mappingMode === 3 ? '' : 'none';
+  scaleUSlider.value = scaleToPos(settings.scaleU); scaleUVal.value = settings.scaleU;
+  scaleVSlider.value = scaleToPos(settings.scaleV); scaleVVal.value = settings.scaleV;
+  offsetUSlider.value = settings.offsetU; offsetUVal.value = settings.offsetU;
+  offsetVSlider.value = settings.offsetV; offsetVVal.value = settings.offsetV;
+  rotationSlider.value = settings.rotation; rotationVal.value = Math.round(settings.rotation);
+  amplitudeSlider.value = settings.textureHeight; amplitudeVal.value = settings.textureHeight;
+  invertDisplacementCheckbox.checked = !!settings.invertDisplacement;
+  seamBlendSlider.value = settings.mappingBlend; seamBlendVal.value = Number(settings.mappingBlend).toFixed(2);
+  seamBandWidthSlider.value = settings.seamBandWidth; seamBandWidthVal.value = Number(settings.seamBandWidth).toFixed(2);
+  capAngleSlider.value = settings.capAngle; capAngleVal.value = Math.round(settings.capAngle);
+  textureSmoothingSlider.value = settings.textureSmoothing; textureSmoothingVal.value = Number(settings.textureSmoothing).toFixed(1);
+}
+
+/** Reflect a layer's texture in the preset grid / custom-map UI. */
+function refreshActiveTextureUI(layer) {
+  document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
+  if (customMapSwatch) customMapSwatch.classList.remove('active');
+  const me = layer?.mapEntry || null;
+  activeMapName.textContent = me?.name || t('ui.noMapSelected');
+  if (!me) return;
+  if (me.isCustom) {
+    _showCustomMapThumb(me);
+    if (customMapSwatch) customMapSwatch.classList.add('active');
+  } else {
+    const idx = PRESETS.findIndex(p => p === me);
+    if (idx >= 0 && _presetSwatches[idx]) _presetSwatches[idx].classList.add('active');
+  }
+}
+
+/** Switch the active layer: persist current UI into the old layer, load the new one. */
+function setActiveLayer(id) {
+  const cur = getActiveLayer();
+  if (cur) syncLayerFromSettings(cur, settings);
+  activeLayerId = id;
+  const next = getActiveLayer();
+  if (!next) return;
+  syncSettingsFromLayer(settings, next);
+  activeMapEntry = next.mapEntry;
+  refreshUVControls();
+  refreshActiveTextureUI(next);
+  renderLayerList();
+  refreshLayerOverlay();
+  updatePreview();
+  _autoSaveSettings();
+}
+
+/** Add a new layer seeded from the current settings (no texture yet). */
+function addLayer() {
+  if (layers.length >= MAX_LAYERS) return;
+  // Persist current UI into the active layer before creating the new one.
+  const cur = getActiveLayer();
+  if (cur) syncLayerFromSettings(cur, settings);
+  const layer = createLayer({ uv: extractUV(settings), colorIndex: layers.length % 8 });
+  layer.mapEntry = null;
+  layers.push(layer);
+  _layerAttrsDirty = true;
+  setActiveLayer(layer.id);
+}
+
+/** Remove a layer; its faces become unassigned. Never removes the last layer. */
+function removeLayer(id) {
+  if (layers.length <= 1) return;
+  const idx = layers.findIndex(l => l.id === id);
+  if (idx < 0) return;
+  layers.splice(idx, 1);
+  _layerAttrsDirty = true;
+  if (activeLayerId === id) {
+    activeLayerId = layers[Math.max(0, idx - 1)].id;
+    const next = getActiveLayer();
+    syncSettingsFromLayer(settings, next);
+    activeMapEntry = next.mapEntry;
+    refreshUVControls();
+    refreshActiveTextureUI(next);
+  }
+  renderLayerList();
+  refreshLayerOverlay();
+  updatePreview();
+  _autoSaveSettings();
+}
+
+/** Rebuild the layer-list DOM. */
+function renderLayerList() {
+  if (!layerList) return;
+  layerList.innerHTML = '';
+  for (const layer of layers) {
+    const row = document.createElement('div');
+    row.className = 'layer-row' + (layer.id === activeLayerId ? ' active' : '');
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+
+    const dot = document.createElement('span');
+    dot.className = 'layer-color-dot';
+    dot.style.background = '#' + layer.color.toString(16).padStart(6, '0');
+    row.appendChild(dot);
+
+    const name = document.createElement('input');
+    name.className = 'layer-name';
+    name.value = layer.name;
+    name.spellcheck = false;
+    name.addEventListener('change', () => { layer.name = name.value.trim() || layer.name; name.value = layer.name; _autoSaveSettings(); });
+    name.addEventListener('click', (e) => e.stopPropagation());
+    row.appendChild(name);
+
+    const meta = document.createElement('span');
+    meta.className = 'layer-meta';
+    meta.textContent = layer.mapEntry?.name || t('ui.noMapSelected');
+    row.appendChild(meta);
+
+    const rm = document.createElement('button');
+    rm.className = 'layer-remove';
+    rm.type = 'button';
+    rm.title = t('ui.removeLayer');
+    rm.setAttribute('aria-label', t('ui.removeLayer'));
+    rm.disabled = layers.length <= 1;
+    rm.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    rm.addEventListener('click', (e) => { e.stopPropagation(); removeLayer(layer.id); });
+    row.appendChild(rm);
+
+    row.addEventListener('click', () => { if (layer.id !== activeLayerId) setActiveLayer(layer.id); });
+    row.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (layer.id !== activeLayerId) setActiveLayer(layer.id); }
+    });
+    layerList.appendChild(row);
+  }
+  if (addLayerBtn) addLayerBtn.disabled = layers.length >= MAX_LAYERS;
+}
+
+// ── Layer region painting ─────────────────────────────────────────────────────
+// Paint target decides whether the brush/bucket tools assign faces to the
+// active texture layer ('layer') or to the displacement mask ('exclude').
+let paintTarget = 'exclude';   // 'exclude' | 'layer'
+
+/** Apply one face mutation according to the current paint target. */
+function _paintApply(faceIdx, erase) {
+  if (paintTarget === 'layer') {
+    const al = getActiveLayer();
+    if (!al) return;
+    if (erase) {
+      al.faceSet.delete(faceIdx);
+    } else {
+      al.faceSet.add(faceIdx);
+      claimFace(layers, faceIdx, al.id);   // keep regions disjoint
+    }
+    _layerAttrsDirty = true;
+  } else {
+    if (erase) excludedFaces.delete(faceIdx); else excludedFaces.add(faceIdx);
+  }
+}
+
+/**
+ * Layer region overlay — always highlights ONLY the active layer's painted
+ * region (in its color), both while painting and when simply selected. Other
+ * layers are not outlined; their textures stay visible on the model underneath.
+ */
+function refreshLayerOverlay() {
+  if (!currentGeometry) { setLayerOverlay(null); return; }
+  const al = getActiveLayer();
+  if (al && al.faceSet.size > 0) {
+    setLayerOverlay(buildLayerOverlayGeo(currentGeometry, [al]));
+  } else {
+    setLayerOverlay(null);
+  }
+}
+
+/** Clear all layer→face assignments (called when a new model is loaded). */
+function _resetLayerAssignments() {
+  for (const l of layers) l.faceSet.clear();
+  paintTarget = 'exclude';
+  _layerAttrsDirty = true;
+  setLayerOverlay(null);
+}
+
+/** Apply the active layer to the whole model (one-click full coverage). */
+function fillActiveLayer() {
+  if (!currentGeometry) return;
+  const al = getActiveLayer();
+  if (!al) return;
+  const triCount = currentGeometry.attributes.position.count / 3;
+  const all = new Set();
+  for (let f = 0; f < triCount; f++) all.add(f);
+  al.faceSet = all;
+  for (const l of layers) if (l.id !== al.id) l.faceSet.clear(); // whole model = this layer
+  _layerAttrsDirty = true;
+  renderLayerList();
+  refreshLayerOverlay();
+  updatePreview();
+  _autoSaveSettings();
+}
+
+/** Toggle layer-region painting on the active layer (uses the brush tool). */
+function toggleLayerPaint() {
+  if (!currentGeometry) return;
+  // Already painting layers → turn the tool off (resets paintTarget + overlay).
+  if (paintTarget === 'layer' && exclusionTool) { setExclusionTool(null); return; }
+  // Precision masking works in a different index space — disable it for layer paint.
+  if (precisionMaskingEnabled) deactivatePrecisionMasking();
+  paintTarget = 'layer';
+  if (exclusionTool !== 'brush') {
+    setExclusionTool('brush');   // activates brush; setExclusionTool reflects layer state
+  } else {
+    // Brush already active (was exclude) — retag and refresh UI.
+    if (layerPaintBtn)  layerPaintBtn.classList.add('active');
+    if (layerPaintHint) layerPaintHint.style.display = '';
+    refreshLayerOverlay();
+  }
+}
 
 // ── Canvas filter support (Safari / iOS WebView don't support ctx.filter) ────
 const CANVAS_FILTER_SUPPORTED = 'filter' in CanvasRenderingContext2D.prototype;
@@ -225,6 +460,11 @@ const dropHint       = document.getElementById('drop-hint');
 const stlFileInput   = document.getElementById('stl-file-input');
 const textureInput   = document.getElementById('texture-file-input');
 const presetGrid     = document.getElementById('preset-grid');
+const layerList      = document.getElementById('layer-list');
+const addLayerBtn    = document.getElementById('add-layer-btn');
+const layerPaintBtn  = document.getElementById('layer-paint-btn');
+const layerFillBtn   = document.getElementById('layer-fill-btn');
+const layerPaintHint = document.getElementById('layer-paint-hint');
 const activeMapName  = document.getElementById('active-map-name');
 const customMapRow      = document.getElementById('custom-map-row');
 const customMapSwatch   = document.getElementById('custom-map-swatch');
@@ -960,6 +1200,9 @@ populateLanguageSelector();
     banner.textContent = 'Warning: language files could not be loaded. The interface may show missing text. Check your network connection and reload the page.';
     document.body.prepend(banner);
   }
+  // Layer list is built dynamically (applyTranslations doesn't reach it) — re-render
+  // now that locale strings are loaded.
+  renderLayerList();
 }
 
 // Sync lang dropdown to current language
@@ -1078,7 +1321,7 @@ async function selectPreset(idx, swatchEl, applyDefaults = true) {
 
   // If full texture is already loaded, use it directly
   if (entry.texture) {
-    activeMapEntry = entry;
+    setActiveMapEntry(entry);
     updatePreview();
     return;
   }
@@ -1089,7 +1332,7 @@ async function selectPreset(idx, swatchEl, applyDefaults = true) {
     const full = await loadFullPreset(idx);
     if (gen !== _selectGeneration) return;   // user clicked another preset meanwhile
     PRESETS[idx] = { ...entry, ...full };
-    activeMapEntry = PRESETS[idx];
+    setActiveMapEntry(PRESETS[idx]);
     swatchEl.classList.remove('preset-loading-full');
     updatePreview();
   } catch (err) {
@@ -1133,7 +1376,7 @@ function _hideCustomMapThumb() {
 /** Promote the kept-aside custom map back to the active map. No defaults reset. */
 function _activateCustomMap() {
   if (!_lastCustomMap) return;
-  activeMapEntry = _lastCustomMap;
+  setActiveMapEntry(_lastCustomMap);
   document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
   customMapSwatch.classList.add('active');
   activeMapName.textContent = _lastCustomMap.name;
@@ -1159,13 +1402,19 @@ if (customMapRemoveBtn) {
       if (idx >= 0 && _presetSwatches[idx] && PRESETS[idx]) {
         selectPreset(idx, _presetSwatches[idx], /*applyDefaults=*/false);
       } else {
-        activeMapEntry = null;
+        setActiveMapEntry(null);
         activeMapName.textContent = t('ui.noMapSelected');
         updatePreview();
       }
     }
   });
 }
+
+// ── Layer list wiring ─────────────────────────────────────────────────────────
+if (addLayerBtn) addLayerBtn.addEventListener('click', addLayer);
+if (layerPaintBtn) layerPaintBtn.addEventListener('click', toggleLayerPaint);
+if (layerFillBtn) layerFillBtn.addEventListener('click', fillActiveLayer);
+renderLayerList();
 
 // ── Welcome popup: open / dismiss ─────────────────────────────────────────────
 function openWelcome({ allowDismissPersist }) {
@@ -1284,12 +1533,13 @@ function wireEvents() {
     const file = e.target.files[0];
     if (!file) return;
     try {
-      activeMapEntry = await loadCustomTexture(file);
-      activeMapEntry.isCustom = true;
-      _lastCustomMap = activeMapEntry;
+      const customEntry = await loadCustomTexture(file);
+      customEntry.isCustom = true;
+      setActiveMapEntry(customEntry);
+      _lastCustomMap = customEntry;
       activeMapName.textContent = file.name;
       document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
-      _showCustomMapThumb(activeMapEntry);
+      _showCustomMapThumb(customEntry);
       customMapSwatch.classList.add('active');
       resetTextureSmoothing();
       updatePreview();
@@ -1579,8 +1829,8 @@ function wireEvents() {
 
   // ── Exclusion tool wiring ─────────────────────────────────────────────────
 
-  exclBrushBtn.addEventListener('click', () => setExclusionTool('brush'));
-  exclBucketBtn.addEventListener('click', () => setExclusionTool('bucket'));
+  exclBrushBtn.addEventListener('click', () => { paintTarget = 'exclude'; setExclusionTool('brush'); });
+  exclBucketBtn.addEventListener('click', () => { paintTarget = 'exclude'; setExclusionTool('bucket'); });
 
   // Shift key toggles erase mode
   document.addEventListener('keydown', (e) => {
@@ -1706,10 +1956,10 @@ function wireEvents() {
         const filled = bucketFill(triIdx, triangleAdjacency, bucketThreshold);
         // Bucket fill always uses original face indices
         for (const t of filled) {
-          if (eraseMode) excludedFaces.delete(t); else excludedFaces.add(t);
+          _paintApply(t, eraseMode);
         }
-        // If precision is active, also sync to precisionExcludedFaces
-        if (precisionMaskingEnabled && precisionParentMap) {
+        // If precision is active, also sync to precisionExcludedFaces (mask only)
+        if (paintTarget !== 'layer' && precisionMaskingEnabled && precisionParentMap) {
           const len = precisionParentMap.length;
           for (let i = 0; i < len; i++) {
             if (filled.has(precisionParentMap[i])) {
@@ -1717,7 +1967,8 @@ function wireEvents() {
             }
           }
         }
-        refreshExclusionOverlay();
+        if (paintTarget === 'layer') { refreshLayerOverlay(); renderLayerList(); updatePreview(); }
+        else refreshExclusionOverlay();
         _lastHoverTriIdx = -1;
         setHoverPreview(null);
       }
@@ -1784,6 +2035,10 @@ function wireEvents() {
     if (!isPainting) return;
     isPainting = false;
     getControls().enabled = true;
+    // Refresh the texture preview at stroke end (layer painting only — the live
+    // colored overlay already tracked the stroke; rebuilding the weight attrs +
+    // material every mousemove would be too costly).
+    if (paintTarget === 'layer') updatePreview();
     // Capture the completed stroke synchronously so quick consecutive strokes
     // each get their own undo entry — the debounced window-pointerup capture
     // would otherwise collapse strokes that finish within UNDO_DEBOUNCE_MS.
@@ -1859,8 +2114,15 @@ function setExclusionTool(tool) {
   if (!(exclusionTool === 'brush' && brushIsRadius)) {
     brushCursorEl.style.display = 'none';
   }
+  // Reflect layer-paint state on the layer-paint toggle + overlay + hint
+  const layerPainting = !!exclusionTool && paintTarget === 'layer';
+  if (layerPaintBtn)  layerPaintBtn.classList.toggle('active', layerPainting);
+  if (layerPaintHint) layerPaintHint.style.display = layerPainting ? '' : 'none';
+  // Painting → all regions; otherwise → active layer's region highlight.
+  refreshLayerOverlay();
   // Re-enable controls if tool was deactivated mid-paint
   if (!exclusionTool) {
+    paintTarget = 'exclude';
     isPainting = false;
     getControls().enabled = true;
     const dbg = document.getElementById('masking-tri-debug');
@@ -2097,7 +2359,9 @@ function _viewDirFor(hitPt) {
 }
 
 function _paintSingleHit(hit, mesh) {
-  const usePrecision = precisionMaskingEnabled && precisionGeometry && precisionParentMap;
+  // Layer-region painting always operates in original-geometry index space
+  // (precision masking is mask-only and is disabled when layer paint is active).
+  const usePrecision = paintTarget !== 'layer' && precisionMaskingEnabled && precisionGeometry && precisionParentMap;
   if (usePrecision) {
     if (brushIsRadius) {
       const r2 = brushRadius * brushRadius;
@@ -2115,11 +2379,9 @@ function _paintSingleHit(hit, mesh) {
     }
     if (brushIsRadius) {
       const r2 = brushRadius * brushRadius;
-      bfsBrushSelect(triIdx, hit.point, r2, _viewDirFor(hit.point), t => {
-        if (eraseMode) excludedFaces.delete(t); else excludedFaces.add(t);
-      });
+      bfsBrushSelect(triIdx, hit.point, r2, _viewDirFor(hit.point), t => _paintApply(t, eraseMode));
     } else {
-      if (eraseMode) excludedFaces.delete(triIdx); else excludedFaces.add(triIdx);
+      _paintApply(triIdx, eraseMode);
     }
   }
 }
@@ -2160,7 +2422,8 @@ function paintAt(e) {
   }
 
   _lastPaintHitPoint = hit.point.clone();
-  refreshExclusionOverlay();
+  if (paintTarget === 'layer') { refreshLayerOverlay(); renderLayerList(); }
+  else refreshExclusionOverlay();
 }
 
 // ── Place on Face ─────────────────────────────────────────────────────────────
@@ -2813,6 +3076,7 @@ function loadDefaultCube() {
   exclusionTool     = null;
   eraseMode         = false;
   isPainting        = false;
+  _resetLayerAssignments();
   if (placeOnFaceActive) togglePlaceOnFace(false);
   if (rotateActive) toggleRotateMode(false);
   rotateAngles = { x: 0, y: 0, z: 0 };
@@ -2953,6 +3217,7 @@ async function handleModelFile(file) {
     exclusionTool     = null;
     eraseMode         = false;
     isPainting        = false;
+    _resetLayerAssignments();
     if (placeOnFaceActive) togglePlaceOnFace(false);
     if (rotateActive) toggleRotateMode(false);
     rotateAngles = { x: 0, y: 0, z: 0 };
@@ -3828,6 +4093,126 @@ function getEffectiveMapEntry() {
   return _effectiveMapCache;
 }
 
+// ── Multi-layer export/bake assembly ──────────────────────────────────────────
+
+/** Blur a layer's map by its own smoothing amount (or return the raw imageData). */
+function _smoothedLayerImageData(mapEntry, smoothing) {
+  if (!mapEntry) return null;
+  if (!smoothing || smoothing === 0) {
+    return { imageData: mapEntry.imageData, width: mapEntry.width, height: mapEntry.height };
+  }
+  const { fullCanvas, width, height } = mapEntry;
+  const tiled = document.createElement('canvas');
+  tiled.width = width * 3; tiled.height = height * 3;
+  const tc = tiled.getContext('2d');
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) tc.drawImage(fullCanvas, c * width, r * height);
+  const blurred = document.createElement('canvas');
+  blurred.width = width * 3; blurred.height = height * 3;
+  blurred.getContext('2d').drawImage(tiled, 0, 0);
+  blurCanvas(blurred, smoothing);
+  const off = document.createElement('canvas');
+  off.width = width; off.height = height;
+  off.getContext('2d').drawImage(blurred, width, height, width, height, 0, 0, width, height);
+  return { imageData: off.getContext('2d').getImageData(0, 0, width, height), width, height };
+}
+
+/** Per-layer bake settings: global projection + this layer's UV transform. */
+function _layerBakeSettings(layer) {
+  return {
+    ...settings,
+    scaleU:   layer.uv.scaleU,
+    scaleV:   layer.uv.scaleV,
+    offsetU:  layer.uv.offsetU,
+    offsetV:  layer.uv.offsetV,
+    rotation: layer.uv.rotation,
+    amplitude: layer.uv.amplitude,
+  };
+}
+
+/**
+ * Assemble per-layer { imageData, imgWidth, imgHeight, settings } for the bake.
+ * Textureless layers contribute zero displacement (neutral grey, amplitude 0).
+ * Returns null when only the single base layer exists (single-texture path).
+ */
+function _buildLayerData() {
+  const al = getActiveLayer();
+  if (al) syncLayerFromSettings(al, settings);   // capture live UI edits
+  return layers.map((layer) => {
+    const eff = _smoothedLayerImageData(layer.mapEntry, layer.uv.textureSmoothing || 0);
+    if (!eff) {
+      const g = settings.symmetricDisplacement ? 127 : 0;
+      const data = new Uint8ClampedArray([g, g, g, 255]);
+      return { imageData: { data, width: 1, height: 1 }, imgWidth: 1, imgHeight: 1,
+               settings: { ..._layerBakeSettings(layer), amplitude: 0 } };
+    }
+    return { imageData: eff.imageData, imgWidth: eff.width, imgHeight: eff.height,
+             settings: _layerBakeSettings(layer) };
+  });
+}
+
+/** Per-original-face layer channel map for the bake/preview (hard, bleed-free). */
+function _buildLayerChannelInput() {
+  if (!currentGeometry) return { faceChannel: null, layerCount: 0 };
+  const triCount = currentGeometry.attributes.position.count / 3;
+  return { faceChannel: buildFaceChannels(layers, triCount), layerCount: layers.length };
+}
+
+// ── Multi-layer GPU preview ───────────────────────────────────────────────────
+// (_layerAttrsDirty is declared with the layer state near the top so init-time
+// calls like _resetLayerAssignments can touch it.)
+
+/** Per-layer uniform arrays for the preview shader (null → single-texture path). */
+function _buildLayerUniforms() {
+  const al = getActiveLayer();
+  if (al) syncLayerFromSettings(al, settings);
+  const maps = [], scale = [], offset = [], rotation = [], amplitude = [], aspect = [];
+  for (const layer of layers) {
+    const me = layer.mapEntry;
+    maps.push(me ? me.texture : null);
+    scale.push([layer.uv.scaleU, layer.uv.scaleV]);
+    offset.push([layer.uv.offsetU, layer.uv.offsetV]);
+    rotation.push((layer.uv.rotation ?? 0) * Math.PI / 180);
+    amplitude.push(me ? layer.uv.amplitude : 0);
+    const w = me?.width ?? 1, h = me?.height ?? 1, tmax = Math.max(w, h, 1);
+    aspect.push([tmax / Math.max(w, 1), tmax / Math.max(h, 1)]);
+  }
+  return { count: layers.length, maps, scale, offset, rotation, amplitude, aspect };
+}
+
+/**
+ * Ensure the active preview geometry carries layerWeightsA/B (vec4×2 = 8
+ * channels). Splits an existing threaded `layerWeights` attribute (subdivided
+ * disp-preview) or builds a one-hot from the base mesh. Rebuilt only when the
+ * dirty flag is set or the attribute is missing / size-mismatched.
+ */
+function _ensureLayerAttrs(geometry) {
+  const count = geometry.attributes.position.count;
+  const have  = geometry.attributes.layerWeightsA;
+  if (!_layerAttrsDirty && have && have.count === count) return;
+
+  let kArr, K;
+  const existing = geometry.attributes.layerWeights;
+  if (existing) { kArr = existing.array; K = existing.itemSize; }
+  else { const lw = buildLayerWeights(geometry, layers); kArr = lw.weights; K = lw.layerCount; }
+
+  const A = new Float32Array(count * 4);
+  const B = new Float32Array(count * 4);
+  for (let i = 0; i < count; i++) {
+    const base = i * K;
+    A[i*4]   = K > 0 ? kArr[base]     : 0;
+    A[i*4+1] = K > 1 ? kArr[base + 1] : 0;
+    A[i*4+2] = K > 2 ? kArr[base + 2] : 0;
+    A[i*4+3] = K > 3 ? kArr[base + 3] : 0;
+    B[i*4]   = K > 4 ? kArr[base + 4] : 0;
+    B[i*4+1] = K > 5 ? kArr[base + 5] : 0;
+    B[i*4+2] = K > 6 ? kArr[base + 6] : 0;
+    B[i*4+3] = K > 7 ? kArr[base + 7] : 0;
+  }
+  geometry.setAttribute('layerWeightsA', new THREE.BufferAttribute(A, 4));
+  geometry.setAttribute('layerWeightsB', new THREE.BufferAttribute(B, 4));
+  _layerAttrsDirty = false;
+}
+
 // Build the regularize.js opts object from current settings.  Centralised so
 // preview / export / bake stay in sync with the Advanced-panel debug knobs.
 function _regularizeOpts() {
@@ -3857,7 +4242,11 @@ function updatePreview() {
     textureAspectV: tmax / Math.max(th, 1),
   };
 
-  if (!activeMapEntry) {
+  // Blank the model only when NO layer has a texture. The active layer may have
+  // no texture (e.g. a freshly added layer) while other layers do — in that case
+  // we still render so their painted regions stay visible.
+  const anyLayerTextured = layers.some(l => l.mapEntry);
+  if (!activeMapEntry && !anyLayerTextured) {
     // No map yet — plain material
     if (previewMaterial) {
       setMeshMaterial(null);
@@ -3880,14 +4269,21 @@ function updatePreview() {
 
   // Ensure faceMask attribute is current before rendering
   updateFaceMask(activeGeo);
+  // Ensure per-layer weight attributes are present (multi-texture preview).
+  _ensureLayerAttrs(activeGeo);
 
-  const effectiveEntry = getEffectiveMapEntry();
+  // Active layer may have no texture; the displacementMap uniform is only used
+  // by the legacy single path — multi-texture samples layerMaps. Fall back to
+  // any textured layer (or null → fallback) so material creation never throws.
+  const effectiveEntry = getEffectiveMapEntry() || layers.find(l => l.mapEntry)?.mapEntry || null;
+  const layerUni = _buildLayerUniforms();
 
   if (!previewMaterial) {
-    previewMaterial = createPreviewMaterial(effectiveEntry.texture, fullSettings);
+    previewMaterial = createPreviewMaterial(effectiveEntry?.texture ?? null, fullSettings);
+    applyLayerUniforms(previewMaterial.uniforms, layerUni);
     loadGeometry(activeGeo, previewMaterial);
   } else {
-    updateMaterial(previewMaterial, effectiveEntry.texture, fullSettings);
+    updateMaterial(previewMaterial, effectiveEntry?.texture ?? null, fullSettings, layerUni);
   }
 
   syncBoundaryEdgeUniforms();
@@ -4241,7 +4637,8 @@ async function toggleDisplacementPreview(enable) {
   if (!enable) {
     // Revert to original geometry with bump-only shading.
     if (currentGeometry && previewMaterial) {
-      updateMaterial(previewMaterial, getEffectiveMapEntry()?.texture, { ...settings, bounds: currentBounds });
+      _ensureLayerAttrs(currentGeometry);
+      updateMaterial(previewMaterial, getEffectiveMapEntry()?.texture, { ...settings, bounds: currentBounds }, _buildLayerUniforms());
       updateFaceMask(currentGeometry);
       setMeshGeometry(currentGeometry);
     }
@@ -4312,7 +4709,8 @@ async function toggleDisplacementPreview(enable) {
         }
       }
       const { geometry: resubPrev, faceParentId: resubParentsPrev } = await subdivide(
-        regPrev.geometry, previewEdge * settings.regularizeSecondPassMul, null, secondPassWeightsPrev, { fast: true }
+        regPrev.geometry, previewEdge * settings.regularizeSecondPassMul, null, secondPassWeightsPrev,
+        { fast: true }
       );
       regPrev.geometry.dispose();
       if (dispPreviewToken !== myToken) { resubPrev.dispose(); return; }
@@ -4338,6 +4736,15 @@ async function toggleDisplacementPreview(enable) {
 
     // Use the face parent IDs tracked through subdivision (O(n) instead of spatial search)
     dispPreviewParentMap = activeParents;
+    // Hard per-face layer weights from the parent map → bleed-free multi-texture
+    // in the 3D preview (matches the bake; no shared-vertex spread).
+    const lcPrev = _buildLayerChannelInput();
+    if (lcPrev.faceChannel && lcPrev.layerCount > 0) {
+      const subTri = dispPreviewGeometry.attributes.position.count / 3;
+      const lwHard = buildLayerWeightsFromParents(subTri, activeParents, lcPrev.faceChannel, lcPrev.layerCount);
+      dispPreviewGeometry.setAttribute('layerWeights', new THREE.BufferAttribute(lwHard, lcPrev.layerCount));
+      _layerAttrsDirty = true;
+    }
     updateFaceMask(activeGeo);
 
     // Force material recreation so it binds the new geometry with smoothNormal
@@ -4347,6 +4754,11 @@ async function toggleDisplacementPreview(enable) {
     }
     const fullSettings = { ...settings, bounds: currentBounds };
     previewMaterial = createPreviewMaterial(getEffectiveMapEntry().texture, fullSettings);
+    // Multi-texture: split the threaded layerWeights into A/B attrs + bind the
+    // per-layer uniforms, else the recreated material defaults to layerCount=1
+    // (single texture) and the 3D preview shows only the active layer.
+    _ensureLayerAttrs(dispPreviewGeometry);
+    applyLayerUniforms(previewMaterial.uniforms, _buildLayerUniforms());
     setMeshGeometry(dispPreviewGeometry);
     setMeshMaterial(previewMaterial);
 
@@ -4438,14 +4850,18 @@ async function handleExport(format = 'stl') {
     // bottom snaps → repair), preferably in the export worker so the UI stays
     // responsive and background-tab throttling can't stall it. Falls back to
     // running inline if the worker can't initialise. See exportPipeline.js.
-    const exportEntry = getEffectiveMapEntry();
+    const exportEntry = getEffectiveMapEntry() || layers.find(l => l.mapEntry)?.mapEntry || null;
+    const lcInput = _buildLayerChannelInput();
     const isStale = () => exportToken !== myToken;
     const result = await runPipeline({
       positions: currentGeometry.attributes.position.array,
       faceWeights,
-      imageData: exportEntry.imageData,
-      imgWidth: exportEntry.width,
-      imgHeight: exportEntry.height,
+      imageData: exportEntry?.imageData ?? null,
+      imgWidth: exportEntry?.width ?? 1,
+      imgHeight: exportEntry?.height ?? 1,
+      layerData: _buildLayerData(),
+      layerFaceChannel: lcInput.faceChannel,
+      layerCount: lcInput.layerCount,
       settings,
       bounds: currentBounds,
       regularizeOpts: _regularizeOpts(),
@@ -4730,13 +5146,17 @@ async function bakeTextures() {
     // snaps; no decimation — it would drop the per-face parent mapping needed
     // to remap user exclusions onto the baked output). Worker-first with
     // inline fallback, same as handleExport.
-    const exportEntry = getEffectiveMapEntry();
+    const exportEntry = getEffectiveMapEntry() || layers.find(l => l.mapEntry)?.mapEntry || null;
+    const lcInput = _buildLayerChannelInput();
     const result = await runPipeline({
       positions: currentGeometry.attributes.position.array,
       faceWeights,
-      imageData: exportEntry.imageData,
-      imgWidth: exportEntry.width,
-      imgHeight: exportEntry.height,
+      imageData: exportEntry?.imageData ?? null,
+      imgWidth: exportEntry?.width ?? 1,
+      imgHeight: exportEntry?.height ?? 1,
+      layerData: _buildLayerData(),
+      layerFaceChannel: lcInput.faceChannel,
+      layerCount: lcInput.layerCount,
       settings,
       bounds: currentBounds,
       regularizeOpts: _regularizeOpts(),
@@ -4942,7 +5362,7 @@ function yieldFrame() {
 // defaults. One-time migration wipes any legacy localStorage payload.
 
 const PROJECT_STORAGE_KEY = 'bumpmesh-settings';
-const PROJECT_VERSION     = 1;
+const PROJECT_VERSION     = 2;  // v2 adds layers.json + layer-<i>.png (texture layers)
 const PROJECT_MAX_IMPORT  = 500 * 1024 * 1024; // 500 MB cap on imports
 try { localStorage.removeItem(PROJECT_STORAGE_KEY); } catch { /* ignore */ }
 
@@ -5255,6 +5675,17 @@ exportGoBtn.addEventListener('click', async () => {
       // sense when shipped alongside the model that produced them.
       const mask = _collectCurrentMask();
       if (mask) zipFiles['mask.json'] = strToU8(JSON.stringify(mask));
+      // Texture layers (regions reference the base geometry too). Custom layer
+      // textures ship as layer-<i>.png; presets restore by name.
+      const layerData = _collectLayers();
+      zipFiles['layers.json'] = strToU8(JSON.stringify(layerData));
+      for (let i = 0; i < layers.length; i++) {
+        const me = layers[i].mapEntry;
+        if (me && me.isCustom && me.fullCanvas) {
+          const lblob = await new Promise(r => me.fullCanvas.toBlob(r, 'image/png'));
+          zipFiles[`layer-${i}.png`] = new Uint8Array(await lblob.arrayBuffer());
+        }
+      }
     }
     if (includeTexture) {
       const blob = await new Promise(r => customSource.fullCanvas.toBlob(r, 'image/png'));
@@ -5319,6 +5750,76 @@ function _collectCurrentMask() {
   // Include-mode with zero painted = "mask everything" — also worth preserving.
   if (liveExcluded.size === 0 && !selectionMode) return null;
   return { selectionMode, excluded: [...liveExcluded] };
+}
+
+/**
+ * Serialize the texture layers (without image bytes) for layers.json. Each
+ * layer records its name, color slot, per-layer UV params, painted face
+ * indices, and a texture reference: a preset name, or a flag that a custom
+ * PNG ships alongside as `layer-<i>.png`.
+ */
+function _collectLayers() {
+  return {
+    activeLayerIndex: Math.max(0, layers.findIndex(l => l.id === activeLayerId)),
+    layers: layers.map((l) => ({
+      name: l.name,
+      colorIndex: l.colorIndex,
+      uv: { ...l.uv },
+      faceSet: [...l.faceSet],
+      preset: (l.mapEntry && !l.mapEntry.isCustom) ? l.mapEntry.name : null,
+      custom: !!(l.mapEntry && l.mapEntry.isCustom),
+    })),
+  };
+}
+
+/**
+ * Rebuild the layers array from layers.json + the zip's per-layer PNGs. Face
+ * indices reference the (just-loaded) base geometry, so call this only in the
+ * model-loading import path. Returns true on success.
+ */
+async function _restoreLayers(ld, unzipped) {
+  if (!ld || !Array.isArray(ld.layers) || ld.layers.length === 0) return false;
+  const triCount = currentGeometry ? (currentGeometry.attributes.position.count / 3) | 0 : 0;
+  const rebuilt = [];
+  for (let i = 0; i < ld.layers.length; i++) {
+    const s = ld.layers[i] || {};
+    const layer = createLayer({
+      name: s.name,
+      uv: s.uv ? { ...extractUV(settings), ...s.uv } : extractUV(settings),
+      colorIndex: s.colorIndex ?? i,
+    });
+    layer.faceSet = new Set((Array.isArray(s.faceSet) ? s.faceSet : [])
+      .filter(f => Number.isInteger(f) && f >= 0 && f < triCount));
+    try {
+      if (s.custom && unzipped[`layer-${i}.png`]) {
+        const file = new File([unzipped[`layer-${i}.png`]], `${s.name || 'layer'}.png`, { type: 'image/png' });
+        const entry = await loadCustomTexture(file);
+        entry.isCustom = true;
+        layer.mapEntry = entry;
+      } else if (s.preset) {
+        const idx = IMAGE_PRESETS.findIndex(p => p.name === s.preset);
+        if (idx >= 0) {
+          const full = await loadFullPreset(idx);
+          PRESETS[idx] = { ...PRESETS[idx], ...full };
+          layer.mapEntry = PRESETS[idx];
+        }
+      }
+    } catch (err) { console.warn(`Layer ${i} texture restore failed:`, err); }
+    rebuilt.push(layer);
+  }
+  layers = rebuilt;
+  const ai = (ld.activeLayerIndex >= 0 && ld.activeLayerIndex < layers.length) ? ld.activeLayerIndex : 0;
+  activeLayerId = layers[ai].id;
+  const al = getActiveLayer();
+  activeMapEntry = al.mapEntry;
+  syncSettingsFromLayer(settings, al);
+  _layerAttrsDirty = true;
+  refreshUVControls();
+  refreshActiveTextureUI(al);
+  renderLayerList();
+  refreshLayerOverlay();
+  updatePreview();
+  return true;
 }
 
 /**
@@ -5416,6 +5917,7 @@ async function importProject(file) {
   _flushUndoCapture();
 
   _undoApplyDepth++;
+  let layersRestored = false;
   try {
     if (loadMode === 'all') {
       // Load model first — handleModelFile resets scaleU/scaleV/offsets/refineLength
@@ -5435,6 +5937,15 @@ async function importProject(file) {
           _restoreMask(mask);
         } catch (err) { console.warn('Could not restore paint mask:', err); }
       }
+
+      // Texture layers (v2+). Face indices reference the model we just loaded.
+      // When present they fully define the textures, so the shared single-
+      // texture restore below is skipped.
+      if (unzipped['layers.json']) {
+        try {
+          layersRestored = await _restoreLayers(JSON.parse(strFromU8(unzipped['layers.json'])), unzipped);
+        } catch (err) { console.warn('Could not restore layers:', err); }
+      }
     } else {
       // Settings only: keep the current model and its mask untouched. We skip
       // model.stl (and never call handleModelFile, so the scale/offset/refine
@@ -5443,7 +5954,9 @@ async function importProject(file) {
       if (data) applySettingsSnapshot(data);
     }
 
-    await _applyImportedTexture(unzipped, data);
+    // Legacy single-texture restore — skipped when v2 layers already rebuilt
+    // the full layer set (which includes textures).
+    if (!layersRestored) await _applyImportedTexture(unzipped, data);
 
     _autoSaveSettings();
   } finally {
@@ -5466,13 +5979,14 @@ async function _applyImportedTexture(unzipped, data) {
   if (unzipped['texture.png']) {
     const texName = (data && data.activeMapName) || 'imported-texture.png';
     const texFile = new File([unzipped['texture.png']], texName, { type: 'image/png' });
-    activeMapEntry = await loadCustomTexture(texFile);
-    activeMapEntry.isCustom = true;
-    activeMapEntry.name = texName;
-    _lastCustomMap = activeMapEntry;
+    const importedEntry = await loadCustomTexture(texFile);
+    importedEntry.isCustom = true;
+    importedEntry.name = texName;
+    setActiveMapEntry(importedEntry);
+    _lastCustomMap = importedEntry;
     activeMapName.textContent = texName;
     document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
-    _showCustomMapThumb(activeMapEntry);
+    _showCustomMapThumb(importedEntry);
     customMapSwatch.classList.add('active');
     updatePreview();
   } else if (data && data.activeMapName) {
