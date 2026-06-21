@@ -10,6 +10,7 @@ import { computeSmartResolution } from './smartResolution.js';
 import { loadAllThumbnails, loadFullPreset, loadCustomTexture, IMAGE_PRESETS }  from './presetTextures.js';
 import { MAX_LAYERS, createLayer, extractUV, findLayer,
          syncSettingsFromLayer, syncLayerFromSettings, claimFace } from './layers.js';
+import { createPreviewMaterial, updateMaterial, applyLayerUniforms } from './previewMaterial.js';
 import { subdivide }          from './subdivision.js';
 import { regularizeMesh }     from './regularize.js';
 import { runExportPipeline }  from './exportPipeline.js';
@@ -22,18 +23,6 @@ import { runFastDiagnostics, runExpensiveDiagnostics,
 import { t, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
 import { QuantizedPointMap } from './meshIndex.js';
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
-
-// Compatibility viewport: keep the canvas on Three.js' plain material instead
-// of compiling the custom texture/displacement shader. Export and bake still
-// use the selected texture/layer data.
-const SIMPLE_VIEWPORT_RENDERING = true;
-
-let createPreviewMaterial;
-let updateMaterial;
-let applyLayerUniforms;
-if (!SIMPLE_VIEWPORT_RENDERING) {
-  ({ createPreviewMaterial, updateMaterial, applyLayerUniforms } = await import('./previewMaterial.js'));
-}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -1730,16 +1719,6 @@ function wireEvents() {
   dispPreviewToggle.addEventListener('change', () => {
     toggleDisplacementPreview(dispPreviewToggle.checked);
   });
-  if (SIMPLE_VIEWPORT_RENDERING) {
-    dispPreviewToggle.checked = false;
-    dispPreviewToggle.disabled = true;
-    const previewLabel = dispPreviewToggle.closest('.checkbox-label');
-    if (previewLabel) {
-      previewLabel.classList.add('disabled');
-      previewLabel.removeAttribute('data-i18n-title');
-      previewLabel.title = '3D Preview is disabled in compatibility mode to avoid GPU driver freezes.';
-    }
-  }
 
   // ── Place on Face ──
   placeOnFaceBtn.addEventListener('click', () => {
@@ -4200,37 +4179,8 @@ function _buildLayerUniforms() {
   return { count: layers.length, maps, scale, offset, rotation, amplitude, aspect };
 }
 
-function _usePlainViewportMaterial() {
-  if (previewMaterial) {
-    setMeshMaterial(null);
-    previewMaterial = null;
-  }
-}
-
-function _showSimpleViewport(canProcessTexture) {
-  if (settings.useDisplacement) {
-    settings.useDisplacement = false;
-    dispPreviewToggle.checked = false;
-  }
-  if (dispPreviewGeometry) {
-    dispPreviewGeometry.dispose();
-    dispPreviewGeometry = null;
-    dispPreviewParentMap = null;
-  }
-
-  const targetGeo = (precisionMaskingEnabled && precisionGeometry)
-    ? precisionGeometry
-    : currentGeometry;
-  const mesh = getCurrentMesh();
-  if (mesh && targetGeo && mesh.geometry !== targetGeo) {
-    setMeshGeometry(targetGeo);
-  }
-  _usePlainViewportMaterial();
-
-  exportBtn.disabled = !canProcessTexture;
-  export3mfBtn.disabled = !canProcessTexture;
-  bakeBtn.disabled = !canProcessTexture || isBaking;
-  updateSmartResBtnState();
+function _hasTexturedLayerAssignments() {
+  return layers.some(layer => layer.mapEntry && layer.faceSet && layer.faceSet.size > 0);
 }
 
 /**
@@ -4302,7 +4252,11 @@ function updatePreview() {
   const anyLayerTextured = layers.some(l => l.mapEntry);
   if (!activeMapEntry && !anyLayerTextured) {
     // No map yet — plain material
-    _usePlainViewportMaterial();
+    if (previewMaterial) {
+      setMeshMaterial(null);
+      previewMaterial.dispose();
+      previewMaterial = null;
+    }
     exportBtn.disabled = true;
     export3mfBtn.disabled = true;
     bakeBtn.disabled = true;
@@ -4310,8 +4264,19 @@ function updatePreview() {
     return;
   }
 
-  if (SIMPLE_VIEWPORT_RENDERING) {
-    _showSimpleViewport(true);
+  if (!_hasTexturedLayerAssignments()) {
+    // A texture can be selected before any region is painted. In that state the
+    // model is intentionally flat, so avoid compiling the heavier texture-layer
+    // shader during page startup.
+    if (previewMaterial) {
+      setMeshMaterial(null);
+      previewMaterial.dispose();
+      previewMaterial = null;
+    }
+    exportBtn.disabled = false;
+    export3mfBtn.disabled = false;
+    bakeBtn.disabled = isBaking;
+    updateSmartResBtnState();
     return;
   }
 
@@ -4677,25 +4642,6 @@ function checkPrecisionOutdated() {
  * When disabled: reverts to the original geometry with bump-only preview.
  */
 async function toggleDisplacementPreview(enable) {
-  if (SIMPLE_VIEWPORT_RENDERING) {
-    settings.useDisplacement = false;
-    dispPreviewToggle.checked = false;
-    if (dispPreviewGeometry) {
-      dispPreviewGeometry.dispose();
-      dispPreviewGeometry = null;
-      dispPreviewParentMap = null;
-    }
-    if (currentGeometry) {
-      const targetGeo = (precisionMaskingEnabled && precisionGeometry)
-        ? precisionGeometry
-        : currentGeometry;
-      if (getCurrentMesh()?.geometry !== targetGeo) setMeshGeometry(targetGeo);
-    }
-    _usePlainViewportMaterial();
-    updatePreview();
-    return;
-  }
-
   settings.useDisplacement = enable;
 
   // Exit surface masking mode when the 3D preview is activated
