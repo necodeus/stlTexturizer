@@ -4179,6 +4179,10 @@ function _buildLayerUniforms() {
   return { count: layers.length, maps, scale, offset, rotation, amplitude, aspect };
 }
 
+function _hasTexturedLayerAssignments() {
+  return layers.some(layer => layer.mapEntry && layer.faceSet && layer.faceSet.size > 0);
+}
+
 /**
  * Ensure the active preview geometry carries layerWeightsA/B (vec4×2 = 8
  * channels). Splits an existing threaded `layerWeights` attribute (subdivided
@@ -4256,6 +4260,22 @@ function updatePreview() {
     exportBtn.disabled = true;
     export3mfBtn.disabled = true;
     bakeBtn.disabled = true;
+    updateSmartResBtnState();
+    return;
+  }
+
+  if (!_hasTexturedLayerAssignments()) {
+    // A texture can be selected before any region is painted. In that state the
+    // model is intentionally flat, so avoid compiling the heavier texture-layer
+    // shader during page startup.
+    if (previewMaterial) {
+      setMeshMaterial(null);
+      previewMaterial.dispose();
+      previewMaterial = null;
+    }
+    exportBtn.disabled = false;
+    export3mfBtn.disabled = false;
+    bakeBtn.disabled = isBaking;
     updateSmartResBtnState();
     return;
   }
@@ -5029,19 +5049,6 @@ function ensurePipelineWorker() {
     );
   }
   return _pipelineWorkerInit;
-}
-
-// Warm the worker up during idle time after load: the worker boot includes
-// fetching three.js (workers ignore the page import map), and doing that now
-// keeps it off the first export's critical path.
-{
-  const warm = () => { ensurePipelineWorker(); };
-  const schedule = () => {
-    if ('requestIdleCallback' in window) requestIdleCallback(warm, { timeout: 8000 });
-    else setTimeout(warm, 3000);
-  };
-  if (document.readyState === 'complete') schedule();
-  else window.addEventListener('load', schedule, { once: true });
 }
 
 function _initPipelineWorker() {
